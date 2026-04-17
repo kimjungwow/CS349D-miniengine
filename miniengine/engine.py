@@ -113,6 +113,22 @@ class Engine:
         return self.tokenizer.decode([token_id], skip_special_tokens=True)
 
     # ── Forward passes ──────────────────────────────────────────────────
+    @torch.inference_mode()
+    def batched_decode(self, requests: list[Request]) -> int:
+        for req in requests:
+            token_id = self.prefill(req)
+            req.output_ids.append(token_id)
+            # self._stream_token(req, token_id) #Later
+        batched_input_ids = torch.tensor(
+            [[req.output_ids[-1] for req in requests]], dtype=torch.long, device=self.device
+        )
+        batched_cache_len = max([req.kv_cache[0][0].shape[2] for req in requests])
+        batched_position_ids = torch.tensor([[batched_cache_len for _ in range(len(requests))]], device=self.device)
+
+        #TODO: Pads per-request KV caches to the max cache length in the batch
+        for req in requests:
+            # req.kv_cache = 
+ 
 
     @torch.inference_mode()
     def prefill(self, request: Request) -> int:
