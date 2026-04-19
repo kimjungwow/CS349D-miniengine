@@ -147,7 +147,7 @@ class Scheduler:
             while not all(self._check_finished(req,req.output_ids[-1]) for req in batch_reqs):
                 token_ids = self.engine.batched_decode(batch_reqs)
                 for i in range(len(batch_reqs)):
-                    batch_reqs[i].output_idx.append(token_ids[i])
+                    batch_reqs[i].output_ids.append(token_ids[i])
                     self._stream_token(batch_reqs[i],token_ids[i])
             for req in batch_reqs:
                 self._finish_request(req, finished)
