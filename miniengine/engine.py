@@ -133,20 +133,41 @@ class Engine:
         batched_position_ids = torch.tensor([[requests[i].kv_cache[0][0].shape[2]] for i in range(len(requests))], device=self.device)
         # batched_position_ids = torch.tensor([[batched_cache_len for _ in range(len(requests))]], device=self.device)
 
+        # (batch, batched_cache_len)
+        attn_mask = torch.ones(len(requests),(batched_cache_len+1),dtype=torch.bool, device=self.device)
+        for i in range(len(requests)):
+            attn_mask[i,requests[i].kv_cache[0][0].shape[2]:] = False
+
         #TODO: Pads per-request KV caches to the max cache length in the batch
         padded_kvcache = []
-        for req in requests:
-            pad_length = batched_cache_len-req.kv_cache[0][0].shape[2]
-            if pad_length > 0:
-                temp_kvcache = []
-                for i in range(len(req.kv_cache)):
-                    k, v = req.kv_cache[i]
+        num_layers = len(requests[0].kv_cache)
+        for i in range(num_layers):
+            per_layer_batched_k = []
+            per_layer_batched_v = []
+            for req in requests:
+                pad_length = batched_cache_len-req.kv_cache[0][0].shape[2]
+                k, v = req.kv_cache[i]
+                if pad_length > 0:
                     k = F.pad(k, (0, 0, 0, pad_length))  # seq dim pad
                     v = F.pad(v, (0, 0, 0, pad_length))
-                    temp_kvcache.append((k,v))
-                padded_kvcache.append(temp_kvcache)
-            else:
-                padded_kvcache.append(req.kv_cache)
+                per_layer_batched_k.append(k[0])
+                per_layer_batched_v.append(v[0])
+            padded_kvcache.append((torch.stack(per_layer_batched_k, dim=0),torch.stack(per_layer_batched_v, dim=0)))
+        
+        print(len(padded_kvcache))
+        print(len(padded_kvcache[0]))
+        print(padded_kvcache[0][0].shape)
+        
+        print(len(requests[0].kv_cache))
+        print(len(requests[0].kv_cache[0]))
+        print(requests[0].kv_cache[0][0].shape)
+        print("@@")
+        logits, kv_caches = self.model(input_ids=batched_input_ids, position_ids=batched_position_ids, kv_caches=padded_kvcache, attn_mask=attn_mask)
+        print(logits.shape)
+        print(kv_caches[0][0].shape)
+        import sys
+        sys.exit(0)
+        
         
 
         

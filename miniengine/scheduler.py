@@ -110,26 +110,38 @@ class Scheduler:
         Returns list of requests that finished in this step.
         """
         finished: list[Request] = []
+        if False:
+            # ── Pick one request ────────────────────────────────────────────
+            with self._lock:
+                if not self.waiting:
+                    return finished
+                req = self.waiting.popleft()
 
-        # ── Pick one request ────────────────────────────────────────────
-        with self._lock:
-            if not self.waiting:
-                return finished
-            req = self.waiting.popleft()
-
-        # ── Prefill ─────────────────────────────────────────────────────
-        req.status = RequestStatus.RUNNING
-        token_id = self.engine.prefill(req)
-        req.output_ids.append(token_id)
-        self._stream_token(req, token_id)
-
-        # ── Decode until finished ───────────────────────────────────────
-        while not self._check_finished(req, token_id):
-            token_id = self.engine.decode_step(req)
+            # ── Prefill ─────────────────────────────────────────────────────
+            req.status = RequestStatus.RUNNING
+            token_id = self.engine.prefill(req)
             req.output_ids.append(token_id)
             self._stream_token(req, token_id)
 
-        self._finish_request(req, finished)
+            # ── Decode until finished ───────────────────────────────────────
+            while not self._check_finished(req, token_id):
+                token_id = self.engine.decode_step(req)
+                req.output_ids.append(token_id)
+                self._stream_token(req, token_id)
+
+            self._finish_request(req, finished)
+        else:
+            batch_reqs = []
+            with self._lock:
+                if not self.waiting:
+                    return finished
+                req = self.waiting.popleft()
+                batch_reqs.append(req)
+            for r in batch_reqs:
+                r.status = RequestStatus.RUNNING
+
+            self.engine.batched_decode(batch_reqs)
+
         return finished
 
     # ── Helpers ─────────────────────────────────────────────────────────
