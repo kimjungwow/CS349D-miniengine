@@ -116,10 +116,6 @@ class Engine:
     # ── Forward passes ──────────────────────────────────────────────────
     @torch.inference_mode()
     def batched_decode(self, requests: list[Request]) -> int:
-        for req in requests:
-            token_id = self.prefill(req)
-            req.output_ids.append(token_id)
-            # self._stream_token(req, token_id) #Later
         
         # (batch, 1)
         batched_input_ids = torch.tensor(
@@ -162,11 +158,23 @@ class Engine:
         print(len(requests[0].kv_cache[0]))
         print(requests[0].kv_cache[0][0].shape)
         print("@@")
-        logits, kv_caches = self.model(input_ids=batched_input_ids, position_ids=batched_position_ids, kv_caches=padded_kvcache, attn_mask=attn_mask)
+        logits, new_kv = self.model(input_ids=batched_input_ids, position_ids=batched_position_ids, kv_caches=padded_kvcache, attn_mask=attn_mask)
         print(logits.shape)
-        print(kv_caches[0][0].shape)
-        import sys
-        sys.exit(0)
+        print(new_kv[0][0].shape)
+        for i in range(len(requests)):
+            for l in range(num_layers):
+                new_token_k = new_kv[l][i][0][:, -1, :]  
+                new_token_k = new_token_k.unsqueeze(0).unsqueeze(2)
+                req.kv_cache[l][0] = torch.cat([req.kv_cache[l][0], new_token_k], dim=2)
+                new_token_v = new_kv[l][i][1][:, -1, :]  
+                new_token_v = new_token_v.unsqueeze(0).unsqueeze(2)
+                req.kv_cache[l][1] = torch.cat([req.kv_cache[l][1], new_token_v], dim=2)
+        
+        # return sample_token(
+            # logits[:, -1, :], request.sampling_params, request.output_ids
+        # )
+        return [sample_token(logits[i,-1,:],requests[i].sampling_params, requests[i].output_ids) for i in range(len(requests)) ]
+    
         
         
 
