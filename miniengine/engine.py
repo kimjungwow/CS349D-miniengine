@@ -29,6 +29,7 @@ from transformers import AutoTokenizer
 from miniengine.core import Request
 from miniengine.model import CausalLM, ModelConfig, load_weights
 from miniengine.sampler import sample_token
+import torch.nn.functional as F
 
 logger = logging.getLogger(__name__)
 
@@ -119,15 +120,38 @@ class Engine:
             token_id = self.prefill(req)
             req.output_ids.append(token_id)
             # self._stream_token(req, token_id) #Later
+        
+        # (batch, 1)
         batched_input_ids = torch.tensor(
-            [[req.output_ids[-1] for req in requests]], dtype=torch.long, device=self.device
+            [[req.output_ids[-1]] for req in requests], dtype=torch.long, device=self.device
         )
+
+        # scalar
         batched_cache_len = max([req.kv_cache[0][0].shape[2] for req in requests])
-        batched_position_ids = torch.tensor([[batched_cache_len for _ in range(len(requests))]], device=self.device)
+        
+        # (batch, 1)
+        batched_position_ids = torch.tensor([[requests[i].kv_cache[0][0].shape[2]] for i in range(len(requests))], device=self.device)
+        # batched_position_ids = torch.tensor([[batched_cache_len for _ in range(len(requests))]], device=self.device)
 
         #TODO: Pads per-request KV caches to the max cache length in the batch
+        padded_kvcache = []
         for req in requests:
-            # req.kv_cache = 
+            pad_length = batched_cache_len-req.kv_cache[0][0].shape[2]
+            if pad_length > 0:
+                temp_kvcache = []
+                for i in range(len(req.kv_cache)):
+                    k, v = req.kv_cache[i]
+                    k = F.pad(k, (0, 0, 0, pad_length))  # seq dim pad
+                    v = F.pad(v, (0, 0, 0, pad_length))
+                    temp_kvcache.append((k,v))
+                padded_kvcache.append(temp_kvcache)
+            else:
+                padded_kvcache.append(req.kv_cache)
+        
+
+        
+        
+
  
 
     @torch.inference_mode()
