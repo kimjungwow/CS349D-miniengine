@@ -147,13 +147,22 @@ class Scheduler:
                 req.output_ids.append(token_id)
                 self._stream_token(req, token_id)
 
-            while not all(self._check_finished(req,req.output_ids[-1]) for req in batch_reqs):
+            while batch_reqs:
                 token_ids = self.engine.batched_decode(batch_reqs)
-                for i in range(len(batch_reqs)):
-                    batch_reqs[i].output_ids.append(token_ids[i])
-                    self._stream_token(batch_reqs[i],token_ids[i])
-            for req in batch_reqs:
-                self._finish_request(req, finished)
+
+                next_batch = []
+                for i, req in enumerate(batch_reqs):
+                    req.output_ids.append(token_ids[i])
+                    self._stream_token(req, token_ids[i])
+                    print("Req ",i, "got",self.engine.decode_token(token_ids[i]))
+
+                    if self._check_finished(req, token_ids[i]):
+                        self._finish_request(req, finished)
+                    else:
+                        next_batch.append(req)
+
+                batch_reqs = next_batch
+
 
         return finished
 
