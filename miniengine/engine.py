@@ -140,20 +140,16 @@ class Engine:
         ).unsqueeze(1)
         # batched_position_ids = torch.tensor([[batched_cache_len for _ in range(len(requests))]], device=self.device)
 
-        # (batch, batched_cache_len)
-        # attn_mask = torch.ones(len(requests),(batched_cache_len+1),dtype=torch.bool, device=self.device)
-        # for i in range(len(requests)):
-        #     attn_mask[i,requests[i].kv_cache[0][0].shape[2]:] = False
+        # Valid keys for each request i:
+        # - real cached tokens: [0, L_i)
+        # - newly appended token: position max_cache_len
+        # Final shape should be (B, 1, 1, K), K=max_cache_len+1.
         cache_lens_t = torch.tensor(cache_lens, device=self.device)  # (B,)
-        # attn_mask = torch.arange(batched_cache_len + 1, device=self.device)[None, :] <= cache_lens_t[:, None]
         positions = torch.arange(batched_cache_len + 1, device=self.device)[None, :]   # (1, T)
         valid_old = positions < cache_lens_t[:, None]                                   # old KV
         valid_new = positions == batched_cache_len                                      # appended token at the end
-        attn_mask = valid_old | valid_new                                               # (B, T)
-        # attn_mask = attn_mask[:, None, None, :]                                         # (B,1,1,T)
+        attn_mask = (valid_old | valid_new)[:, None, None, :]                          # (B,1,1,T)
         num_layers = len(requests[0].kv_cache)
-        # attn_mask = attn_mask[:, None, None, :]
-        attn_mask = attn_mask[:, None, None, :].expand(-1, 32, 1, -1) # FIXME: hardcoded 32 maybe number of heads?
         
 
         #TODO: Pads per-request KV caches to the max cache length in the batch
@@ -197,9 +193,11 @@ class Engine:
             print(batched_input_ids.shape)
             print(batched_position_ids.shape)
             print(padded_kvcache[0][0].shape)
-        for i, req in enumerate(requests):
-            decode_step = len(req.output_ids)
-            print(f"[req {i}] decode step: {decode_step}")
+        
+        if False:
+            for i, req in enumerate(requests):
+                decode_step = len(req.output_ids)
+                print(f"[req {i}] decode step: {decode_step}, {cache_lens[i]}, {batched_cache_len}")
         logits, new_kv = self.model(input_ids=batched_input_ids, position_ids=batched_position_ids, kv_caches=padded_kvcache, attn_mask=attn_mask)
         if False:
             print(len(padded_kvcache))
