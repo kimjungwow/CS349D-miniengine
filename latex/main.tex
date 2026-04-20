@@ -1,0 +1,167 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{lmodern}
+
+\title{CS349D MiniEngine\\Milestone 1 Report: Batching and Continuous Batching}
+\author{Your Name \\ SUNetID}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\section{Objective}
+This milestone upgrades the scheduler from naive single-request execution to:
+\begin{enumerate}
+  \item batched decode (multiple requests in one forward pass), and
+  \item continuous batching (iteration-level admission/removal each scheduler step).
+\end{enumerate}
+The goal is to improve throughput while keeping generation quality/correctness unchanged.
+
+\section{Baseline and Design}
+\subsection{Baseline}
+The baseline scheduler handles one request at a time:
+\begin{enumerate}
+  \item prefill one request,
+  \item decode it until completion,
+  \item move to the next request.
+\end{enumerate}
+This underutilizes the GPU because decode runs as many thin matrix-vector operations instead of a larger batched matrix-matrix operation.
+
+\subsection{Milestone 1 Design}
+I implemented two changes:
+\begin{enumerate}
+  \item \textbf{Batched decode}: stack each running request's last generated token and run one batched forward call per decode iteration.
+  \item \textbf{Continuous batching}: in every scheduler step, admit new requests (up to \texttt{max\_running}), prefill admitted requests, decode all active requests once, then retire finished requests.
+\end{enumerate}
+
+\section{Implementation Details}
+\subsection{Files Modified}
+\begin{itemize}
+  \item \texttt{miniengine/scheduler.py}
+  \item \texttt{miniengine/engine.py}
+  \item \texttt{miniengine/model.py}
+\end{itemize}
+
+\subsection{Model/Attention Interface}
+I threaded an optional \texttt{attn\_mask} through:
+\texttt{Attention} $\rightarrow$ \texttt{TransformerBlock} $\rightarrow$ \texttt{TransformerModel} $\rightarrow$ \texttt{CausalLM}.
+When the mask is present, it is passed to \texttt{scaled\_dot\_product\_attention}; otherwise the original causal path is used.
+
+\subsection{Batched Decode and KV Cache Handling}
+For a batch with per-request cache lengths $\{L_i\}$:
+\begin{enumerate}
+  \item Compute \texttt{max\_cache\_len = max($L_i$)}.
+  \item Pad each request's per-layer KV cache to \texttt{max\_cache\_len}.
+  \item Build an attention mask over key positions \texttt{K = max\_cache\_len + 1}.
+  \item Run one batched decode forward pass.
+  \item For request $i$, keep old valid KV prefix \texttt{[:,:,$:L_i$,:]} and append only the newly generated token KV.
+\end{enumerate}
+
+\subsection{Mask Correctness Note}
+The decode mask marks valid positions as:
+\begin{itemize}
+  \item old real cache tokens \texttt{[0, $L_i$)},
+  \item and the newly appended token at \texttt{max\_cache\_len}.
+\end{itemize}
+Padding region between \texttt{$L_i$} and \texttt{max\_cache\_len-1} is masked out.
+Mask shape is \texttt{(B, 1, 1, K)}.
+
+\subsection{Other Code Changes (If Any)}
+If you changed additional parts beyond scheduling, explain them here and justify why they helped correctness/performance.
+\begin{itemize}
+  \item Example: tokenizer-side optimization
+  \item Example: stopping criteria cleanup
+  \item Example: stream-path overhead reduction
+\end{itemize}
+
+\section{Experimental Setup}
+\subsection{Hardware}
+\begin{itemize}
+  \item CPU: \textit{fill in}
+  \item RAM: \textit{fill in}
+  \item GPU: \textit{fill in}
+  \item CUDA / driver version: \textit{fill in}
+\end{itemize}
+
+\subsection{Software}
+\begin{itemize}
+  \item Model: \texttt{Qwen/Qwen3-4B-Instruct-2507} (or your chosen model)
+  \item Dtype: \texttt{bfloat16} / \texttt{float16} (\textit{fill in})
+  \item Command used to launch server:
+\end{itemize}
+
+\begin{verbatim}
+python -m miniengine --model Qwen/Qwen3-4B-Instruct-2507 --dtype bfloat16 --max-running 16
+\end{verbatim}
+
+\begin{itemize}
+  \item Benchmark command:
+\end{itemize}
+
+\begin{verbatim}
+python -m benchmark.bench_serving --input-len 512 --output-len 256 --concurrencies 1,4,8,16
+\end{verbatim}
+
+\section{Results}
+\subsection{Raw Metrics}
+Replace placeholders with your measured numbers.
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{lrrrr}
+\hline
+Method @ Concurrency & TTFT p50 (ms) & Completion p50 (ms) & TPOT p50 (ms) & Gen Throughput (tok/s) \\
+\hline
+Baseline @ 1 & \textit{fill} & \textit{fill} & \textit{fill} & \textit{fill} \\
+Baseline @ 4 & \textit{fill} & \textit{fill} & \textit{fill} & \textit{fill} \\
+Baseline @ 8 & \textit{fill} & \textit{fill} & \textit{fill} & \textit{fill} \\
+Baseline @ 16 & \textit{fill} & \textit{fill} & \textit{fill} & \textit{fill} \\
+\hline
+Batched+Continuous @ 1 & \textit{fill} & \textit{fill} & \textit{fill} & \textit{fill} \\
+Batched+Continuous @ 4 & \textit{fill} & \textit{fill} & \textit{fill} & \textit{fill} \\
+Batched+Continuous @ 8 & \textit{fill} & \textit{fill} & \textit{fill} & \textit{fill} \\
+Batched+Continuous @ 16 & \textit{fill} & \textit{fill} & \textit{fill} & \textit{fill} \\
+\hline
+\end{tabular}
+\caption{Serving metrics comparison between baseline and Milestone 1 implementation.}
+\end{table}
+
+\subsection{Performance Gain Summary}
+Summarize key gains, e.g.:
+\begin{itemize}
+  \item Throughput improvement at concurrency 16: \textit{X}\(\times\)
+  \item Completion latency reduction at concurrency 16: \textit{Y}\%
+  \item TTFT impact: \textit{brief note}
+\end{itemize}
+
+\section{Discussion}
+\subsection{What Worked}
+Briefly discuss why batching improved utilization in your implementation.
+
+\subsection{Tradeoffs / Limitations}
+Examples:
+\begin{itemize}
+  \item prefill is still unbatched,
+  \item extra overhead from per-step padding,
+  \item sensitivity to request length distribution.
+\end{itemize}
+
+\subsection{Hardware Choice Rationale}
+Since this milestone allows flexible hardware, explain why your CPU/GPU config was chosen and any observed bottlenecks.
+
+\section{Conclusion}
+This milestone demonstrates that batched decode + continuous batching provides measurable performance gain over the naive baseline while preserving generation correctness.
+
+\section*{Submission Checklist}
+\begin{itemize}
+  \item PDF includes design and implementation description.
+  \item PDF includes baseline vs optimized metrics.
+  \item Hardware/software setup is documented.
+  \item Any extra code changes are justified.
+\end{itemize}
+
+\end{document}
