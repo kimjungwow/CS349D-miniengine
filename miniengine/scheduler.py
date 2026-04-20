@@ -133,10 +133,13 @@ class Scheduler:
         else:
             batch_reqs = []
             with self._lock:
-                if not self.waiting:
-                    return finished
-                req = self.waiting.popleft()
-                batch_reqs.append(req)
+                for _ in range(self.max_running):
+                    if not self.waiting:
+                        break
+                    req = self.waiting.popleft()
+                    batch_reqs.append(req)
+            if len(batch_reqs) == 0:
+                return finished
             token_idx = []
             for req in batch_reqs:
                 req.status = RequestStatus.RUNNING

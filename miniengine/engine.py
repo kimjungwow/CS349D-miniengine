@@ -156,25 +156,25 @@ class Engine:
                 per_layer_batched_v.append(v[0])
             padded_kvcache.append((torch.stack(per_layer_batched_k, dim=0),torch.stack(per_layer_batched_v, dim=0)))
         
-        print(len(padded_kvcache))
-        print(len(padded_kvcache[0]))
-        print(padded_kvcache[0][0].shape)
-        
-        print(len(requests[0].kv_cache))
-        print(len(requests[0].kv_cache[0]))
-        print(requests[0].kv_cache[0][0].shape)
-        print("@@")
+
         logits, new_kv = self.model(input_ids=batched_input_ids, position_ids=batched_position_ids, kv_caches=padded_kvcache, attn_mask=attn_mask)
-        print(logits.shape)
-        print(new_kv[0][0].shape)
+        if False:
+            print(len(padded_kvcache))
+            print(len(padded_kvcache[0]))
+            print(padded_kvcache[0][0].shape)
+            
+            print(len(requests[0].kv_cache))
+            print(len(requests[0].kv_cache[0]))
+            print(requests[0].kv_cache[0][0].shape)
+            print("@@")
+            print(logits.shape)
+            print(new_kv[0][0].shape)
         for i in range(len(requests)):
             for l in range(num_layers):
                 new_token_k = new_kv[l][0][i][:, -1, :]  
                 new_token_k = new_token_k.unsqueeze(0).unsqueeze(2)
-                # req.kv_cache[l] = (torch.cat([req.kv_cache[l][0], new_token_k], dim=2),torch.cat([req.kv_cache[l][1], new_token_v], dim=2))
                 new_token_v = new_kv[l][1][i][:, -1, :]  
                 new_token_v = new_token_v.unsqueeze(0).unsqueeze(2)
-                # req.kv_cache[l][1] = torch.cat([req.kv_cache[l][1], new_token_v], dim=2)
                 req.kv_cache[l] = (torch.cat([req.kv_cache[l][0], new_token_k], dim=2),torch.cat([req.kv_cache[l][1], new_token_v], dim=2))
         
         # return sample_token(
