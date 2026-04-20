@@ -145,8 +145,14 @@ class Engine:
         # for i in range(len(requests)):
         #     attn_mask[i,requests[i].kv_cache[0][0].shape[2]:] = False
         cache_lens_t = torch.tensor(cache_lens, device=self.device)  # (B,)
-        attn_mask = torch.arange(batched_cache_len + 1, device=self.device)[None, :] <= cache_lens_t[:, None]
+        # attn_mask = torch.arange(batched_cache_len + 1, device=self.device)[None, :] <= cache_lens_t[:, None]
+        positions = torch.arange(batched_cache_len + 1, device=self.device)[None, :]   # (1, T)
+        valid_old = positions < cache_lens_t[:, None]                                   # old KV
+        valid_new = positions == batched_cache_len                                      # appended token at the end
+        attn_mask = valid_old | valid_new                                               # (B, T)
+        # attn_mask = attn_mask[:, None, None, :]                                         # (B,1,1,T)
         num_layers = len(requests[0].kv_cache)
+        # attn_mask = attn_mask[:, None, None, :]
         attn_mask = attn_mask[:, None, None, :].expand(-1, 32, 1, -1) # FIXME: hardcoded 32 maybe number of heads?
         
 
