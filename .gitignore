@@ -57,3 +57,8 @@ Thumbs.db
 *.pt
 *.pth
 *.gguf
+
+bin
+share/man/man1
+lib64
+pyvenv.cfg
