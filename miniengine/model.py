@@ -227,7 +227,11 @@ class Attention(nn.Module):
 
         # Scaled dot-product attention (uses Flash Attention when available)
         is_causal = kv_cache is None and seq_len > 1
-        out = F.scaled_dot_product_attention(q, k, v, is_causal=is_causal, attn_mask=attn_mask)
+        if attn_mask is None:
+            out = F.scaled_dot_product_attention(q, k, v, is_causal=is_causal)
+        else:
+            out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, is_causal=False)
+        # out = F.scaled_dot_product_attention(q, k, v, is_causal=is_causal, attn_mask=attn_mask)
 
         # Merge heads → project back
         out = out.transpose(1, 2).contiguous().view(bsz, seq_len, -1)
