@@ -152,19 +152,38 @@ class Engine:
 
         #TODO: Pads per-request KV caches to the max cache length in the batch
         padded_kvcache = []
+        if True:
+            for l in range(num_layers):
+                k0, v0 = requests[0].kv_cache[l]   # shape: (1, n_heads, seq, head_dim)
+                _, n_heads, _, head_dim = k0.shape
+
+                batched_k = k0.new_zeros((batch_size, n_heads, batched_cache_len, head_dim))
+                batched_v = v0.new_zeros((batch_size, n_heads, batched_cache_len, head_dim))
+
+                for b, req in enumerate(requests):
+                    k, v = req.kv_cache[l]
+                    seq_len = k.shape[2]
+                    batched_k[b, :, :seq_len, :] = k[0]
+                    batched_v[b, :, :seq_len, :] = v[0]
+
+                padded_kvcache.append((batched_k, batched_v))
         
-        for i in range(num_layers):
-            per_layer_batched_k = []
-            per_layer_batched_v = []
-            for req in requests:
-                pad_length = batched_cache_len-req.kv_cache[0][0].shape[2]
-                k, v = req.kv_cache[i]
-                if pad_length > 0:
-                    k = F.pad(k, (0, 0, 0, pad_length))  # seq dim pad
-                    v = F.pad(v, (0, 0, 0, pad_length))
-                per_layer_batched_k.append(k[0])
-                per_layer_batched_v.append(v[0])
-            padded_kvcache.append((torch.stack(per_layer_batched_k, dim=0),torch.stack(per_layer_batched_v, dim=0)))
+        else:
+            for i in range(num_layers):
+                per_layer_batched_k = []
+                per_layer_batched_v = []
+                for req in requests:
+                    pad_length = batched_cache_len-req.kv_cache[0][0].shape[2]
+                    k, v = req.kv_cache[i]
+                    if pad_length > 0:
+                        # print(k.shape)
+                        k = F.pad(k, (0, 0, 0, pad_length))  # seq dim pad
+                        # print(k.shape)
+                        # sys.exit(0)
+                        v = F.pad(v, (0, 0, 0, pad_length))
+                    per_layer_batched_k.append(k[0])
+                    per_layer_batched_v.append(v[0])
+                padded_kvcache.append((torch.stack(per_layer_batched_k, dim=0),torch.stack(per_layer_batched_v, dim=0)))
         
 
         if False:
@@ -172,6 +191,9 @@ class Engine:
             print(batched_input_ids.shape)
             print(batched_position_ids.shape)
             print(padded_kvcache[0][0].shape)
+        for i, req in enumerate(requests):
+            decode_step = len(req.output_ids)
+            print(f"[req {i}] decode step: {decode_step}")
         logits, new_kv = self.model(input_ids=batched_input_ids, position_ids=batched_position_ids, kv_caches=padded_kvcache, attn_mask=attn_mask)
         if False:
             print(len(padded_kvcache))
@@ -184,7 +206,8 @@ class Engine:
             print("@@")
             print(logits.shape)
             print(new_kv[0][0].shape)
-        for i in range(len(requests)):
+        
+        for i, req in enumerate(requests):
             for l in range(num_layers):
                 new_token_k = new_kv[l][0][i][:, -1, :]  
                 new_token_k = new_token_k.unsqueeze(0).unsqueeze(2)
