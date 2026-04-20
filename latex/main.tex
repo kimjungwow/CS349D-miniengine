@@ -5,6 +5,7 @@
 \usepackage[utf8]{inputenc}
 \usepackage{lmodern}
 \usepackage{booktabs}
+\usepackage{graphicx}
 
 \title{CS349D MiniEngine\\Milestone 1 Report: Batching and Continuous Batching}
 \author{Jungwoo Kim}
@@ -25,7 +26,7 @@ I implemented two changes. First, batched decode runs newly arrived requests' pr
 
 \section{Experimental Setup}
 \subsection{Software}
-The benchmark uses model \texttt{Qwen/Qwen3-4B-Instruct-2507}. It runs 200 requests from a WildChat prompt pool. The configured input length is \texttt{512}. The configured output length is \texttt{256}. The log shows input min/max/mean as 512/521/516. The concurrency sweep is \texttt{1,4,8,16}. The provided artifact \texttt{b3.txt} does not include exact hardware details.
+The benchmark uses model \texttt{Qwen/Qwen3-4B-Instruct-2507}. It runs 200 requests from a WildChat prompt pool. The configured input length is \texttt{512}. The configured output length is \texttt{256}. The log shows input min/max/mean as 512/521/516. The concurrency sweep is \texttt{1,4,8,16}.
 
 The server command pattern is:
 
@@ -40,7 +41,6 @@ python -m benchmark.bench_serving --input-len 512 --output-len 256 --concurrenci
 \end{verbatim}
 
 \section{Results}
-\subsection{Observed Scaling Trends}
 
 \begin{table}[h]
 \centering
@@ -49,28 +49,66 @@ python -m benchmark.bench_serving --input-len 512 --output-len 256 --concurrenci
 \toprule
 Concurrency & TTFT p50 (ms) & Completion p50 (ms) & TPOT p50 (ms) & Gen Throughput (tok/s) \\
 \midrule
-1  & 2445  & 19238  & 65.9  & 13 \\
-4  & 4955  & 88624  & 328.8 & 12 \\
-8  & 7526  & 119270 & 443.2 & 17 \\
-16 & 13780 & 161954 & 581.4 & 24 \\
+1  & 2463 & 19349  & 66.2  & 13 \\
+4  & 2751 & 89249  & 339.1 & 11 \\
+8  & 5245 & 120384 & 452.4 & 17 \\
+16 & 7689 & 182182 & 693.0 & 22 \\
 \bottomrule
 \end{tabular}
-\caption{Serving benchmark metrics extracted from \texttt{b3.txt}.}
+\caption{Serving benchmark metrics extracted from the 200 requests scenario.}
 \end{table}
+Throughput rises from 13 tok/s at concurrency 1 to 22 tok/s at concurrency 16. This is about 1.69\(\times\). Throughput is not monotonic at low and mid concurrency (13 \(\rightarrow\) 11 \(\rightarrow\) 17 \(\rightarrow\) 22). This suggests overhead and workload-mix effects before batching gains dominate. TTFT and completion latency both increase with concurrency. This is expected with heavier queueing and shared-step decode.
 
-Throughput rises from 13 tok/s at concurrency 1 to 24 tok/s at concurrency 16. This is about 1.85\(\times\). Throughput is not monotonic at low and mid concurrency (13 \(\rightarrow\) 12 \(\rightarrow\) 17 \(\rightarrow\) 24). This suggests overhead and workload-mix effects before batching gains dominate. TTFT and completion latency both increase with concurrency. This is expected with heavier queueing and shared-step decode.
+\textbf{Scalability: }
+Generation throughput does not increase monotonically at low concurrency because the system is not yet in a regime where batching fully offsets its overheads. 
+When concurrency rises from 1 to 4, throughput drops from 13 tok/s to 11 tok/s because each decode iteration now carries extra batching costs, including additional scheduler overhead, batching overhead, KV-cache padding, and larger attention-mask handling, while the batch is still too small to deliver a strong GPU-efficiency gain. 
+In other words, the implementation begins to pay the cost of batching before it fully captures the benefit of batching. 
 
-\section{Discussion}
-\subsection{What Worked}
-Batched decode improves aggregate token throughput at higher concurrency. It shifts decode work toward larger GPU kernels. Continuous batching also helps. It avoids waiting for a full static batch to drain before new requests can join.
+As concurrency increases further to 8 and 16, throughput does improve because the decode path can amortize fixed overhead across more active requests and the GPU sees larger batched work. 
+However, the increase is still sublinear rather than proportional to concurrency. 
+The main reason is that the batched decode cost grows with the largest active cache length in the batch, 
+since the implementation pads every request’s KV cache to the maximum sequence length among running requests. 
+This means additional requests do not contribute pure throughput gain; 
+they also increase padding waste and per-step compute. 
 
-\subsection{Tradeoffs / Limitations}
-Prefill remains unbatched. Large prompts can still dominate front-end latency. Per-step KV padding adds overhead. This is more visible when request lengths vary a lot. The provided artifact has one metric set (\texttt{b3.txt}). It does not include an explicit naive-baseline run under the same setup. Because of that, this report cannot show a strict baseline-vs-optimized delta table yet.
+Prefill is also still unbatched, so front-end work does not scale as efficiently as decode. 
+As a result, concurrency helps at higher levels, but the gains are increasingly limited by padding overhead, memory traffic, and batch heterogeneity, which is why throughput rises only gradually instead of scaling in proportion to concurrency.
 
-\subsection{Milestone Alignment}
-The implementation matches milestone requirements. The scheduler supports iteration-level admission, decode, and retirement across many running requests. The engine provides a batched decode path with padded KV and attention masking. The model forward path accepts propagated attention masks down to SDPA.
 
-\section{Conclusion}
-Batched decode and continuous batching are integrated end to end in the MiniEngine serving path. In the provided run, throughput reaches 24 tok/s at concurrency 16. The next step is to run an explicit naive baseline with the same setup. That will let us report direct speedup and latency deltas.
+
+% \textbf{What Worked: }
+% Batched decode improves aggregate token throughput at higher concurrency. It shifts decode work toward larger GPU kernels. Continuous batching also helps. It avoids waiting for a full static batch to drain before new requests can join.
+
+% \subsection{Tradeoffs / Limitations}
+% Prefill remains unbatched. Large prompts can still dominate front-end latency. Per-step KV padding adds overhead. This is more visible when request lengths vary a lot. The provided artifact has one metric set (\texttt{b3.txt}). It does not include an explicit naive-baseline run under the same setup. Because of that, this report cannot show a strict baseline-vs-optimized delta table yet.
+
+% \subsection{Milestone Alignment}
+% The implementation matches milestone requirements. The scheduler supports iteration-level admission, decode, and retirement across many running requests. The engine provides a batched decode path with padded KV and attention masking. The model forward path accepts propagated attention masks down to SDPA.
+
+
+\subsection{Discussion}
+\begin{figure}[h]
+\centering
+\includegraphics[width=\linewidth]{comparison.pdf}
+\caption{Comparison of serving metrics between the 32-request scenario and the 200-request scenario.}
+\label{fig:comparison}
+\end{figure}
+
+Figure~\ref{fig:comparison} compares the scaling behavior of the 32-request and 200-request runs, with the same configurations of concurrency. The goal of this comparison is to understand how the system behaves under different numbers of total requests. It can be used to understand why we need enough number of requests for estimating the performance of serving engines.
+
+The gap between the 32 requests scenario and the 200 requests scenario comes from how long continuous batching can keep the running set full. 
+With only 32 requests, the batch drains quickly as requests finish especially in larger batch sizes. 
+With 200 requests, the scheduler can keep admitting new work, so the system stays closer to a steady batched regime. 
+This is why the 200 requests scenario has much lower TTFT at high concurrency: newly arrived requests are admitted and prefilling is amortized more consistently across iterations. 
+However, the 200 requests scenario has higher completion latency and TPOT. 
+In my implementation, each decode step runs over all running requests and pads every KV cache to the maximum active sequence length in the batch. 
+Since the 200 requests scenario keeps larger batches alive for longer, it pays this padding cost more often and for more steps. 
+That improves utilization, but it also increases wasted computation and slows per-token generation. 
+By contrast, the 32 requests scenario drains faster, so its batches become smaller over time and incur less padding overhead, which helps throughput slightly. 
+Overall, the 200 requests scenario benefits from more stable continuous batching, while the 32 requests scenario benefits from less persistent padding overhead. 
+The results therefore show the main tradeoff of the current design: continuous batching improves admission efficiency and TTFT under sustained load, but without length-aware batching, it also increases decode inefficiency and completion latency.
+
+% \section{Conclusion}
+% Batched decode and continuous batching are integrated end to end in the MiniEngine serving path. In the provided run, throughput reaches 22 tok/s at concurrency 16. The next step is to run an explicit naive baseline with the same setup. That will let us report direct speedup and latency deltas.
 
 \end{document}
