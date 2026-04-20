@@ -104,30 +104,27 @@ def prepare_requests(
     output_len: int,
     randomness: float,
 ) -> list[dict]:
-    """
-    Prepare requests with controlled input/output lengths.
+    def unwrap_input_ids(ids):
+        if hasattr(ids, "keys") and "input_ids" in ids:
+            return ids["input_ids"]
+        return ids
 
-    randomness:
-        1.0 = all requests use exactly (input_len, output_len)
-        0.0 = uniform random from [1, input_len] and [1, output_len]
-        0.5 = uniform random from [input_len/2, input_len] etc.
-    """
     requests = []
     for i in range(num_requests):
-        # Compute this request's target lengths
         if randomness >= 1.0:
             req_input_len = input_len
             req_output_len = output_len
         else:
-            lo_frac = randomness  # e.g. 0.5 → sample from [50%, 100%] of target
+            lo_frac = randomness
             min_in = max(1, int(input_len * lo_frac))
             min_out = max(1, int(output_len * lo_frac))
             req_input_len = random.randint(min_in, input_len)
             req_output_len = random.randint(min_out, output_len)
 
-        # Pick a prompt and truncate/pad to target input length
         raw_prompt = prompts[i % len(prompts)]
         messages = [{"role": "user", "content": raw_prompt}]
+        actual_input_len = 0
+
         try:
             ids = tokenizer.apply_chat_template(
                 messages, tokenize=True, add_generation_prompt=True,
@@ -137,19 +134,19 @@ def prepare_requests(
             ids = tokenizer.apply_chat_template(
                 messages, tokenize=True, add_generation_prompt=True,
             )
+        ids = unwrap_input_ids(ids)
 
         if len(ids) > req_input_len:
-            # Truncate: decode back to text from truncated ids
-            # Keep the chat template structure by truncating user content
             truncated_ids = ids[:req_input_len]
             truncated_text = tokenizer.decode(truncated_ids, skip_special_tokens=True)
             messages = [{"role": "user", "content": truncated_text}]
             actual_input_len = req_input_len
+
         elif len(ids) < req_input_len:
-            # Pad by repeating the prompt
             filler = " The quick brown fox jumps over the lazy dog."
             padded = raw_prompt
-            while True:
+
+            for _ in range(200):
                 padded += filler
                 msgs = [{"role": "user", "content": padded}]
                 try:
@@ -161,10 +158,14 @@ def prepare_requests(
                     test_ids = tokenizer.apply_chat_template(
                         msgs, tokenize=True, add_generation_prompt=True,
                     )
+                test_ids = unwrap_input_ids(test_ids)
+
+                messages = msgs
+                actual_input_len = len(test_ids)
+
                 if len(test_ids) >= req_input_len:
-                    messages = msgs
-                    actual_input_len = len(test_ids)
                     break
+
         else:
             actual_input_len = len(ids)
 
