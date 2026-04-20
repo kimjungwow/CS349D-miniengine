@@ -133,35 +133,47 @@ class Scheduler:
         else:
             batch_reqs = []
             with self._lock:
-                for _ in range(self.max_running):
+                available_slots = self.max_running - len(self.running)
+                for _ in range(available_slots):
                     if not self.waiting:
                         break
                     req = self.waiting.popleft()
                     batch_reqs.append(req)
-            if len(batch_reqs) == 0:
-                return finished
-            token_idx = []
+
             for req in batch_reqs:
                 req.status = RequestStatus.RUNNING
+                self.running.append(req)
                 token_id = self.engine.prefill(req)
                 req.output_ids.append(token_id)
                 self._stream_token(req, token_id)
 
-            while batch_reqs:
-                token_ids = self.engine.batched_decode(batch_reqs)
-
-                next_batch = []
-                for i, req in enumerate(batch_reqs):
+            if self.running:
+                token_ids = self.engine.batched_decode(self.running)
+                for i, req in enumerate(self.running):
                     req.output_ids.append(token_ids[i])
                     self._stream_token(req, token_ids[i])
-                    print("Req ",i, "got",self.engine.decode_token(token_ids[i]))
+                    # print("Req ",i, "got",self.engine.decode_token(token_ids[i]))
 
                     if self._check_finished(req, token_ids[i]):
                         self._finish_request(req, finished)
-                    else:
-                        next_batch.append(req)
+                        self.running.remove(req)
 
-                batch_reqs = next_batch
+            # while batch_reqs:
+            #     token_ids = self.engine.batched_decode(batch_reqs)
+
+            #     next_batch = []
+            #     for i, req in enumerate(batch_reqs):
+            #         req.output_ids.append(token_ids[i])
+            #         self._stream_token(req, token_ids[i])
+            #         print("Req ",i, "got",self.engine.decode_token(token_ids[i]))
+
+            #         if self._check_finished(req, token_ids[i]):
+            #             self._finish_request(req, finished)
+            #             self.running.remove(req)
+            #         else:
+            #             next_batch.append(req)
+
+            #     batch_reqs = next_batch
 
 
         return finished
