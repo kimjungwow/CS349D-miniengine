@@ -126,11 +126,18 @@ class Engine:
         
         # (batch, 1)
         batched_input_ids = torch.tensor(
-            [[req.output_ids[-1]] for req in requests], dtype=torch.long, device=self.device
-        )
+            [req.output_ids[-1] for req in requests],
+            dtype=torch.long,
+            device=self.device,
+        ).unsqueeze(1)
 
         # (batch, 1)
-        batched_position_ids = torch.tensor([[l] for l in cache_lens], device=self.device)
+
+        batched_position_ids = torch.tensor(
+            cache_lens,
+            dtype=torch.long,
+            device=self.device,
+        ).unsqueeze(1)
         # batched_position_ids = torch.tensor([[batched_cache_len for _ in range(len(requests))]], device=self.device)
 
         # (batch, batched_cache_len)
@@ -139,10 +146,13 @@ class Engine:
         #     attn_mask[i,requests[i].kv_cache[0][0].shape[2]:] = False
         cache_lens_t = torch.tensor(cache_lens, device=self.device)  # (B,)
         attn_mask = torch.arange(batched_cache_len + 1, device=self.device)[None, :] <= cache_lens_t[:, None]
+        num_layers = len(requests[0].kv_cache)
+        attn_mask = attn_mask[:, None, None, :].expand(-1, 32, 1, -1) # FIXME: hardcoded 32 maybe number of heads?
+        
 
         #TODO: Pads per-request KV caches to the max cache length in the batch
         padded_kvcache = []
-        num_layers = len(requests[0].kv_cache)
+        
         for i in range(num_layers):
             per_layer_batched_k = []
             per_layer_batched_v = []
@@ -157,6 +167,11 @@ class Engine:
             padded_kvcache.append((torch.stack(per_layer_batched_k, dim=0),torch.stack(per_layer_batched_v, dim=0)))
         
 
+        if False:
+            print(">>",attn_mask.shape)
+            print(batched_input_ids.shape)
+            print(batched_position_ids.shape)
+            print(padded_kvcache[0][0].shape)
         logits, new_kv = self.model(input_ids=batched_input_ids, position_ids=batched_position_ids, kv_caches=padded_kvcache, attn_mask=attn_mask)
         if False:
             print(len(padded_kvcache))
