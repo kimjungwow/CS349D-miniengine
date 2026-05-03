@@ -57,7 +57,6 @@ def parse_args() -> argparse.Namespace:
         default=32,
         help="Tokens per KV cache page. Smaller = less tail waste; larger = smaller page tables.",
     )
-    p.add_argument("--mode", choices=["baseline", "batched", "paged"], default="batched")
     p.add_argument("--mem-fraction-static", type=float, default=0.85)
     return p.parse_args()
 
