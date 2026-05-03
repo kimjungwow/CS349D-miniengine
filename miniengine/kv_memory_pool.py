@@ -124,4 +124,8 @@ class KVMemoryPool:
         bytes_budget: int,
     ) -> KVMemoryPool:
         """Convenience: derive `num_pages` from a memory budget."""
-        raise NotImplementedError
+        element_size = torch.finfo(dtype).bits // 8 if dtype.is_floating_point else 2
+        # cache shape: (num_layers, 2, num_pages, page_size, num_kv_heads, head_dim)
+        bytes_per_page = 2 * num_layers * page_size * num_kv_heads * head_dim * element_size
+        num_pages = max(1, bytes_budget // bytes_per_page)
+        return cls(num_pages, page_size, num_layers, num_kv_heads, head_dim, dtype, device)
