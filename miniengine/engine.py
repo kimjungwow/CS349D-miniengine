@@ -29,6 +29,7 @@ from transformers import AutoTokenizer
 from miniengine.core import Request
 from miniengine.model import CausalLM, ModelConfig, load_weights
 from miniengine.sampler import sample_token
+from miniengine.kv_memory_pool import KVMemoryPool
 
 logger = logging.getLogger(__name__)
 
@@ -43,11 +44,13 @@ class Engine:
         device: str = "cuda",
         mode: str = "batched",
         page_size: int = 32,
+        mem_fraction_static: float = 0.85,
     ):
         self.device = device
         self.dtype = dtype
         self.mode = mode
         self.page_size = page_size
+        self.mem_fraction_static = mem_fraction_static
 
         # ── Tokenizer (still from HF — it's just a tokenizer) ──────────
         logger.info("Loading tokenizer from %s …", model_path)
@@ -76,6 +79,20 @@ class Engine:
         with torch.device("meta"):
             self.model = CausalLM(config)
         load_weights(self.model, model_path, dtype=dtype, device=device)
+        if mode == "paged":
+            torch.cuda.synchronize()
+            total = torch.cuda.get_device_properties(device).total_memory
+            used  = torch.cuda.memory_allocated(device)
+            budget = int(self.mem_fraction_static * total) - used
+            self.kv_pool = KVMemoryPool.from_budget(
+                num_layers=config.num_hidden_layers,
+                num_kv_heads=config.num_key_value_heads,
+                head_dim=config.head_dim,
+                page_size=page_size,
+                dtype=dtype,
+                device=device,
+                bytes_budget=budget,
+            )
         self.model.eval()
 
         # ── Stop tokens ─────────────────────────────────────────────────

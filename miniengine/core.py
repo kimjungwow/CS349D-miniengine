@@ -15,7 +15,6 @@ import time
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from typing import Any
-from kv_memory_pool import KVMemoryPool
 
 
 class RequestStatus(Enum):
