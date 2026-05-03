@@ -46,9 +46,10 @@ def parse_args() -> argparse.Namespace:
         "--mode",
         type=str,
         default="batched",
-        choices=["baseline", "batched"],
-        help="Scheduling mode: baseline (one request at a time) or "
-        "batched (iteration-level batching, milestone 1)",
+        choices=["baseline", "batched", "paged"],
+        help="Scheduling mode: baseline (one request at a time), "
+        "batched (iteration-level batching, milestone 1), or "
+        "paged (packed prefill + paged KV, milestone 2)",
     )
     p.add_argument(
         "--page-size",
@@ -56,6 +57,8 @@ def parse_args() -> argparse.Namespace:
         default=32,
         help="Tokens per KV cache page. Smaller = less tail waste; larger = smaller page tables.",
     )
+    p.add_argument("--mode", choices=["baseline", "batched", "paged"], default="batched")
+    p.add_argument("--mem-fraction-static", type=float, default=0.85)
     return p.parse_args()
 
 
@@ -78,7 +81,8 @@ def main() -> None:
     )
 
     engine = Engine(
-        model_path=args.model, dtype=dtype, device=args.device, mode=args.mode,page_size=args.page_size,
+        model_path=args.model, dtype=dtype, device=args.device, mode=args.mode,mode=args.mode, page_size=args.page_size,
+                mem_fraction_static=args.mem_fraction_static,
     )
     sched = Scheduler(engine=engine, max_running=args.max_running, mode=args.mode)
 

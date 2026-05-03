@@ -200,6 +200,8 @@ class Attention(nn.Module):
         sin: torch.Tensor,
         kv_cache: tuple[torch.Tensor, torch.Tensor] | None = None,
         attention_mask: torch.Tensor | None = None,
+        cu_seqlens: torch.Tensor | None = None,
+        max_seqlen: int | None = None,
     ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
         """
         Args:
@@ -210,6 +212,9 @@ class Attention(nn.Module):
             attention_mask: optional float mask (batch, 1, q_len, kv_len)
                             for batched decode with padded KV; 0 = attend,
                             -inf = ignore.
+            cu_seqlens:     (batch+1,) int32 cumulative sequence lengths for
+                            packed prefill; triggers flash_attn_varlen_func.
+            max_seqlen:     maximum sequence length in the packed batch.
 
         Returns:
             output:       (batch, seq_len, hidden_size)
@@ -248,23 +253,43 @@ class Attention(nn.Module):
             v = torch.cat([kv_cache[1], v], dim=2)
         new_kv = (k, v)
 
-        # GQA: expand KV heads to match Q heads
-        if self.num_kv_groups > 1:
-            k = k[:, :, None, :, :].expand(-1, -1, self.num_kv_groups, -1, -1)
-            k = k.reshape(bsz, self.num_heads, -1, self.head_dim)
-            v = v[:, :, None, :, :].expand(-1, -1, self.num_kv_groups, -1, -1)
-            v = v.reshape(bsz, self.num_heads, -1, self.head_dim)
-
-        # Batched decode passes an explicit float mask; otherwise fall
-        # back to the is_causal kernel path.
-        if attention_mask is not None:
-            out = F.scaled_dot_product_attention(q, k, v, attn_mask=attention_mask)
+        if cu_seqlens is not None:
+            # Packed prefill: flash_attn_varlen_func handles GQA natively —
+            # do not expand k/v before passing.
+            from flash_attn import flash_attn_varlen_func
+            # (1, heads, total_tokens, head_dim) → (total_tokens, heads, head_dim)
+            q_fa = q.squeeze(0).transpose(0, 1).contiguous()
+            k_fa = k.squeeze(0).transpose(0, 1).contiguous()
+            v_fa = v.squeeze(0).transpose(0, 1).contiguous()
+            out = flash_attn_varlen_func(
+                q_fa, k_fa, v_fa,
+                cu_seqlens_q=cu_seqlens,
+                cu_seqlens_k=cu_seqlens,
+                max_seqlen_q=max_seqlen,
+                max_seqlen_k=max_seqlen,
+                causal=True,
+            )
+            # (total_tokens, num_heads, head_dim) → (1, total_tokens, hidden_size)
+            out = out.reshape(1, seq_len, self.num_heads * self.head_dim)
         else:
-            is_causal = kv_cache is None and seq_len > 1
-            out = F.scaled_dot_product_attention(q, k, v, is_causal=is_causal)
+            # GQA: expand KV heads to match Q heads
+            if self.num_kv_groups > 1:
+                k = k[:, :, None, :, :].expand(-1, -1, self.num_kv_groups, -1, -1)
+                k = k.reshape(bsz, self.num_heads, -1, self.head_dim)
+                v = v[:, :, None, :, :].expand(-1, -1, self.num_kv_groups, -1, -1)
+                v = v.reshape(bsz, self.num_heads, -1, self.head_dim)
 
-        # Merge heads → project back
-        out = out.transpose(1, 2).contiguous().view(bsz, seq_len, -1)
+            # Batched decode passes an explicit float mask; otherwise fall
+            # back to the is_causal kernel path.
+            if attention_mask is not None:
+                out = F.scaled_dot_product_attention(q, k, v, attn_mask=attention_mask)
+            else:
+                is_causal = kv_cache is None and seq_len > 1
+                out = F.scaled_dot_product_attention(q, k, v, is_causal=is_causal)
+
+            # Merge heads → project back
+            out = out.transpose(1, 2).contiguous().view(bsz, seq_len, -1)
+
         return self.o_proj(out), new_kv
 
 
@@ -312,10 +337,12 @@ class TransformerBlock(nn.Module):
         sin: torch.Tensor,
         kv_cache: tuple[torch.Tensor, torch.Tensor] | None = None,
         attention_mask: torch.Tensor | None = None,
+        cu_seqlens: torch.Tensor | None = None,
+        max_seqlen: int | None = None,
     ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
         residual = hidden
         hidden = self.input_layernorm(hidden)
-        hidden, new_kv = self.self_attn(hidden, cos, sin, kv_cache, attention_mask)
+        hidden, new_kv = self.self_attn(hidden, cos, sin, kv_cache, attention_mask, cu_seqlens, max_seqlen)
         hidden = residual + hidden
 
         residual = hidden
@@ -347,6 +374,8 @@ class TransformerModel(nn.Module):
         position_ids: torch.Tensor,
         kv_caches: list[tuple[torch.Tensor, torch.Tensor]] | None = None,
         attention_mask: torch.Tensor | None = None,
+        cu_seqlens: torch.Tensor | None = None,
+        max_seqlen: int | None = None,
     ) -> tuple[torch.Tensor, list[tuple[torch.Tensor, torch.Tensor]]]:
         """
         Args:
@@ -354,6 +383,8 @@ class TransformerModel(nn.Module):
             position_ids:   (batch, seq_len)
             kv_caches:      list of per-layer (key, value) caches, or None
             attention_mask: optional float mask for batched-decode SDPA
+            cu_seqlens:     (batch+1,) int32 for packed prefill
+            max_seqlen:     maximum sequence length in the packed batch
 
         Returns:
             hidden:         (batch, seq_len, hidden_size)
@@ -365,7 +396,7 @@ class TransformerModel(nn.Module):
         new_kv_caches: list[tuple[torch.Tensor, torch.Tensor]] = []
         for i, layer in enumerate(self.layers):
             kv = kv_caches[i] if kv_caches is not None else None
-            hidden, new_kv = layer(hidden, cos, sin, kv, attention_mask)
+            hidden, new_kv = layer(hidden, cos, sin, kv, attention_mask, cu_seqlens, max_seqlen)
             new_kv_caches.append(new_kv)
 
         hidden = self.norm(hidden)
@@ -392,6 +423,8 @@ class CausalLM(nn.Module):
         position_ids: torch.Tensor,
         kv_caches: list[tuple[torch.Tensor, torch.Tensor]] | None = None,
         attention_mask: torch.Tensor | None = None,
+        cu_seqlens: torch.Tensor | None = None,
+        max_seqlen: int | None = None,
     ) -> tuple[torch.Tensor, list[tuple[torch.Tensor, torch.Tensor]]]:
         """
         Returns:
@@ -399,7 +432,7 @@ class CausalLM(nn.Module):
             new_kv_caches: per-layer KV caches
         """
         hidden, new_kv_caches = self.model(
-            input_ids, position_ids, kv_caches, attention_mask
+            input_ids, position_ids, kv_caches, attention_mask, cu_seqlens, max_seqlen
         )
         if self.config.tie_word_embeddings:
             logits = F.linear(hidden, self.model.embed_tokens.weight)

@@ -165,6 +165,52 @@ class Engine:
         )
 
     @torch.inference_mode()
+    def batched_prefill(self, requests: list[Request]) -> list[int]:
+        """
+        Packed prefill for a batch of requests in a single forward pass.
+
+        All prompts are concatenated into one sequence; flash_attn_varlen_func
+        ensures each token attends only to earlier tokens in the same prompt.
+        The returned per-request KV slices have the same shape as prefill(),
+        so batched_decode works unchanged.
+        """
+        seq_lens = [len(req.input_ids) for req in requests]
+
+        cu_seqlens = torch.zeros(len(requests) + 1, dtype=torch.int32, device=self.device)
+        cu_seqlens[1:] = torch.tensor(seq_lens, dtype=torch.int32, device=self.device).cumsum(0)
+        max_seqlen = max(seq_lens)
+
+        packed_ids = torch.tensor(
+            [tok for req in requests for tok in req.input_ids],
+            dtype=torch.long, device=self.device,
+        ).unsqueeze(0)
+
+        packed_pos = torch.cat([
+            torch.arange(l, device=self.device) for l in seq_lens
+        ]).unsqueeze(0)
+
+        logits, kv_caches = self.model(
+            packed_ids, packed_pos, kv_caches=None,
+            cu_seqlens=cu_seqlens, max_seqlen=max_seqlen,
+        )
+
+        token_ids = []
+        for i, req in enumerate(requests):
+            start = int(cu_seqlens[i].item())
+            end   = int(cu_seqlens[i + 1].item())
+
+            req.kv_cache = [
+                (kv[0][:, :, start:end, :], kv[1][:, :, start:end, :])
+                for kv in kv_caches
+            ]
+
+            token_ids.append(
+                sample_token(logits[:, end - 1, :], req.sampling_params, req.output_ids)
+            )
+
+        return token_ids
+
+    @torch.inference_mode()
     def decode_step(self, request: Request) -> int:
         """
         Run one decode step for a request that has already been prefilled.

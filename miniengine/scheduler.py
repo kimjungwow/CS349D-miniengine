@@ -111,6 +111,8 @@ class Scheduler:
         """
         if self.mode == "baseline":
             return self._step_baseline()
+        if self.mode == "paged":
+            return self._step_paged()
         return self._step_batched()
 
     def _step_baseline(self) -> list[Request]:
@@ -161,6 +163,50 @@ class Scheduler:
                 self._finish_request(req, finished)
             else:
                 self.running.append(req)
+
+        # ── Phase 2: batched decode ─────────────────────────────────────
+        if self.running:
+            token_ids = self.engine.batched_decode(self.running)
+            still_running: list[Request] = []
+            for req, token_id in zip(self.running, token_ids):
+                req.output_ids.append(token_id)
+                self._stream_token(req, token_id)
+                if self._check_finished(req, token_id):
+                    self._finish_request(req, finished)
+                else:
+                    still_running.append(req)
+            self.running = still_running
+
+        return finished
+
+    def _step_paged(self) -> list[Request]:
+        """
+        Iteration-level batched step for paged mode:
+          Phase 1 — packed batched prefill for all newly admitted requests.
+          Phase 2 — batched decode: one token for every running request.
+        """
+        finished: list[Request] = []
+
+        # ── Phase 1: admit + packed prefill ────────────────────────────
+        with self._lock:
+            to_prefill: list[Request] = []
+            while (
+                self.waiting and len(self.running) + len(to_prefill) < self.max_running
+            ):
+                to_prefill.append(self.waiting.popleft())
+
+        if to_prefill:
+            for req in to_prefill:
+                req.status = RequestStatus.RUNNING
+
+            token_ids_prefill = self.engine.batched_prefill(to_prefill)
+            for req, token_id in zip(to_prefill, token_ids_prefill):
+                req.output_ids.append(token_id)
+                self._stream_token(req, token_id)
+                if self._check_finished(req, token_id):
+                    self._finish_request(req, finished)
+                else:
+                    self.running.append(req)
 
         # ── Phase 2: batched decode ─────────────────────────────────────
         if self.running:
