@@ -81,7 +81,7 @@ def main() -> None:
     )
 
     engine = Engine(
-        model_path=args.model, dtype=dtype, device=args.device, mode=args.mode,mode=args.mode, page_size=args.page_size,
+        model_path=args.model, dtype=dtype, device=args.device, mode=args.mode, page_size=args.page_size,
                 mem_fraction_static=args.mem_fraction_static,
     )
     sched = Scheduler(engine=engine, max_running=args.max_running, mode=args.mode)
