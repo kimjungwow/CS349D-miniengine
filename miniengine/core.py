@@ -15,6 +15,7 @@ import time
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from typing import Any
+from kv_memory_pool import KVMemoryPool
 
 
 class RequestStatus(Enum):
@@ -55,7 +56,10 @@ class Request:
     arrival_time: float = field(default_factory=time.time)
 
     # Per-request KV cache (set by Engine during prefill, updated on each decode)
-    kv_cache: Any = None
+    kv_cache: list[int] = field(default_factory=list)
+
+    # How many KV tokens have been written into the pool so far (Part B)
+    num_kv_tokens: int = 0
 
     # Streaming output channel — scheduler pushes, server consumes
     token_queue: queue.Queue = field(default_factory=queue.Queue)

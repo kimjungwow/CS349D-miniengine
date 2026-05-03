@@ -42,10 +42,12 @@ class Engine:
         dtype: torch.dtype = torch.bfloat16,
         device: str = "cuda",
         mode: str = "batched",
+        page_size: int = 32,
     ):
         self.device = device
         self.dtype = dtype
         self.mode = mode
+        self.page_size = page_size
 
         # ── Tokenizer (still from HF — it's just a tokenizer) ──────────
         logger.info("Loading tokenizer from %s …", model_path)

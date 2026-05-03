@@ -15,6 +15,9 @@ document the tradeoffs.
 from __future__ import annotations
 
 import torch
+import math
+
+from collections import deque
 
 
 class KVMemoryPool:
@@ -43,27 +46,60 @@ class KVMemoryPool:
         dtype: torch.dtype,
         device: str,
     ) -> None:
-        raise NotImplementedError
+        self.num_pages = num_pages
+        self.page_size = page_size
+        self.num_layers = num_layers
+        self.num_kv_heads = num_kv_heads
+        self.head_dim = head_dim
+        self.dtype = dtype
+        self.device = device
+
+        # Indices of currently-free pages
+        self.free: deque[int] = deque(range(num_pages))
+
+        # Fused K+V tensor: [num_layers, 2, num_pages, page_size, num_kv_heads, head_dim]
+        # Indexed as cache[layer, 0/1, page_idx, slot, kv_head, :] for K/V respectively.
+        self.cache = torch.zeros(
+            num_layers,
+            2,
+            num_pages,
+            page_size,
+            num_kv_heads,
+            head_dim,
+            dtype=dtype,
+            device=device,
+        )
+        self._kv_caches = [
+            (self.cache[layer, 0], self.cache[layer, 1])
+            for layer in range(num_layers)
+        ]
 
     def allocate(self, num_pages: int) -> list[int]:
         """Reserve `num_pages` pages and return their indices.
 
         Raises if the pool cannot satisfy the request.
         """
-        raise NotImplementedError
+        if num_pages > len(self.free):
+            raise ValueError("num_pages is bigger than available pages.")
+        ret = []
+        for _ in range(num_pages):
+            ret.append(self.free.popleft())
+        raise ret
 
     def free(self, page_indices: list[int]) -> None:
         """Return the listed pages to the free pool."""
-        raise NotImplementedError
+        for i in page_indices:
+            self.free.append(i)
+            # TODO: Zeroize?
 
     def pages_needed(self, seq_len: int) -> int:
         """How many pages are required to store `seq_len` tokens."""
-        raise NotImplementedError
+        return math.ceil(seq_len / self.page_size)
 
     @property
     def num_free(self) -> int:
         """Pages currently available for allocation."""
-        raise NotImplementedError
+        return len(self.free)
 
     @property
     def kv_caches(self) -> list[tuple[torch.Tensor, torch.Tensor]]:
@@ -74,7 +110,7 @@ class KVMemoryPool:
         design — but it must be STABLE: no reallocation, no resizing,
         no swapping out the tensors after construction.
         """
-        raise NotImplementedError
+        return self._kv_caches
 
     @classmethod
     def from_budget(
