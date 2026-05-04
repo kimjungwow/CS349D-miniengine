@@ -80,6 +80,11 @@ class Engine:
             self.model = CausalLM(config)
         load_weights(self.model, model_path, dtype=dtype, device=device)
         if mode == "paged":
+            if page_size % 256 != 0:
+                raise ValueError(
+                    f"--page-size must be a multiple of 256 for paged mode "
+                    f"(flash_attn_with_kvcache kernel tile constraint); got {page_size}"
+                )
             torch.cuda.synchronize()
             total = torch.cuda.get_device_properties(device).total_memory
             used  = torch.cuda.memory_allocated(device)
@@ -93,11 +98,6 @@ class Engine:
                 device=device,
                 bytes_budget=budget,
             )
-            # Transitional: per-request page indices live here while the
-            # compute paths still use req.kv_cache for legacy tensor storage.
-            # Once paging is wired through prefill/decode, pages move onto
-            # req.kv_cache and this dict goes away.
-            self._pages_per_request: dict[str, list[int]] = {}
         self.model.eval()
 
         # ── Stop tokens ─────────────────────────────────────────────────
@@ -123,19 +123,23 @@ class Engine:
     # ── Page lifecycle (paged mode) ─────────────────────────────────────
 
     def acquire_pages_for(self, request: Request) -> None:
-        """Allocate enough pool pages to hold `request`'s prompt and track
-        them under the request's id. No-op outside paged mode.
+        """Allocate enough pool pages for the request's full lifetime
+        (prompt + max_new_tokens) and store the page indices on
+        `request.kv_cache`. No-op outside paged mode.
         """
         if self.mode != "paged":
             return
-        num_pages = self.kv_pool.pages_needed(request.num_input_tokens)
+        total_len = (
+            request.num_input_tokens + request.sampling_params.max_new_tokens
+        )
+        num_pages = self.kv_pool.pages_needed(total_len)
         pages = self.kv_pool.allocate(num_pages) if num_pages > 0 else []
-        self._pages_per_request[request.request_id] = pages
+        request.kv_cache = pages
         logger.debug(
-            "Acquired %d pages for %s (prompt_len=%d, pool_free=%d)",
+            "Acquired %d pages for %s (total_len=%d, pool_free=%d)",
             num_pages,
             request.request_id,
-            request.num_input_tokens,
+            total_len,
             self.kv_pool.num_free,
         )
 
@@ -145,7 +149,7 @@ class Engine:
         """
         if self.mode != "paged":
             return
-        pages = self._pages_per_request.pop(request.request_id, None)
+        pages = request.kv_cache
         if not pages:
             return
         self.kv_pool.free(pages)
@@ -208,12 +212,9 @@ class Engine:
     @torch.inference_mode()
     def batched_prefill(self, requests: list[Request]) -> list[int]:
         """
-        Packed prefill for a batch of requests in a single forward pass.
+        Packed paged prefill: scatter K/V into pool pages, run varlen attention.
 
-        All prompts are concatenated into one sequence; flash_attn_varlen_func
-        ensures each token attends only to earlier tokens in the same prompt.
-        The returned per-request KV slices have the same shape as prefill(),
-        so batched_decode works unchanged.
+        Pages must already be allocated on each request via acquire_pages_for.
         """
         seq_lens = [len(req.input_ids) for req in requests]
 
@@ -230,24 +231,85 @@ class Engine:
             torch.arange(l, device=self.device) for l in seq_lens
         ]).unsqueeze(0)
 
-        logits, kv_caches = self.model(
-            packed_ids, packed_pos, kv_caches=None,
+        # Slot mapping: for each packed token, the flat index
+        # (page_idx * page_size + slot_in_page) into the pool's per-layer
+        # K/V tensors.
+        slot_mapping_list: list[int] = []
+        for req in requests:
+            pages = req.kv_cache  # list[int]
+            for t in range(req.num_input_tokens):
+                page = pages[t // self.page_size]
+                slot_mapping_list.append(page * self.page_size + (t % self.page_size))
+        slot_mapping = torch.tensor(
+            slot_mapping_list, dtype=torch.int64, device=self.device,
+        )
+
+        logits, _ = self.model(
+            packed_ids, packed_pos,
+            kv_caches=None,
             cu_seqlens=cu_seqlens, max_seqlen=max_seqlen,
+            kv_pool=self.kv_pool.kv_caches,
+            slot_mapping=slot_mapping,
         )
 
         token_ids = []
         for i, req in enumerate(requests):
-            start = int(cu_seqlens[i].item())
-            end   = int(cu_seqlens[i + 1].item())
-
-            req.kv_cache = [
-                (kv[0][:, :, start:end, :], kv[1][:, :, start:end, :])
-                for kv in kv_caches
-            ]
-
+            end = int(cu_seqlens[i + 1].item())
+            req.num_kv_tokens = req.num_input_tokens
             token_ids.append(
                 sample_token(logits[:, end - 1, :], req.sampling_params, req.output_ids)
             )
+
+        return token_ids
+
+    @torch.inference_mode()
+    def batched_decode(self, requests: list[Request]) -> list[int]:
+        """
+        Paged batched decode using flash_attn_with_kvcache.
+
+        Reads existing KV from the pool through each request's page table
+        (req.kv_cache) and writes the new step's K/V at cache_seqlens[b]
+        in-place. Increments req.num_kv_tokens by 1 per request.
+        """
+        if not requests:
+            return []
+        batch_size = len(requests)
+
+        input_ids = torch.tensor(
+            [[req.output_ids[-1]] for req in requests],
+            dtype=torch.long, device=self.device,
+        )
+
+        cache_seqlens = torch.tensor(
+            [req.num_kv_tokens for req in requests],
+            dtype=torch.int32, device=self.device,
+        )
+        # RoPE position = current cache length (where the new token is written)
+        position_ids = cache_seqlens.long().unsqueeze(1)  # (B, 1)
+
+        max_pages = max(len(req.kv_cache) for req in requests)
+        block_table = torch.zeros(
+            batch_size, max_pages, dtype=torch.int32, device=self.device,
+        )
+        for i, req in enumerate(requests):
+            block_table[i, :len(req.kv_cache)] = torch.tensor(
+                req.kv_cache, dtype=torch.int32, device=self.device,
+            )
+
+        logits, _ = self.model(
+            input_ids, position_ids,
+            kv_caches=None,
+            kv_pool=self.kv_pool.kv_caches,
+            block_table=block_table,
+            cache_seqlens=cache_seqlens,
+        )
+
+        token_ids: list[int] = []
+        for i, req in enumerate(requests):
+            token_ids.append(
+                sample_token(logits[i:i+1, -1, :], req.sampling_params, req.output_ids)
+            )
+            req.num_kv_tokens += 1
 
         return token_ids
 
@@ -281,12 +343,12 @@ class Engine:
     def is_stop_token(self, token_id: int) -> bool:
         return token_id in self.stop_token_ids
 
-    # ── Batched decode ──────────────────────────────────────────────────
+    # ── Legacy batched decode (milestone-1 batched mode) ────────────────
 
     @torch.inference_mode()
-    def batched_decode(self, requests: list[Request]) -> list[int]:
+    def batched_decode_legacy(self, requests: list[Request]) -> list[int]:
         """
-        Decode one token for each request in a single forward pass.
+        Legacy SDPA-based batched decode for milestone-1 `--mode batched`.
 
         Pads per-request KV caches to the longest in the batch, builds a
         float attention mask that ignores padding, runs the model once,

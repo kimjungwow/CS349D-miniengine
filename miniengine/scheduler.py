@@ -166,7 +166,7 @@ class Scheduler:
 
         # ── Phase 2: batched decode ─────────────────────────────────────
         if self.running:
-            token_ids = self.engine.batched_decode(self.running)
+            token_ids = self.engine.batched_decode_legacy(self.running)
             still_running: list[Request] = []
             for req, token_id in zip(self.running, token_ids):
                 req.output_ids.append(token_id)
@@ -209,7 +209,7 @@ class Scheduler:
                 else:
                     self.running.append(req)
 
-        # ── Phase 2: batched decode ─────────────────────────────────────
+        # ── Phase 2: batched decode (paged) ─────────────────────────────
         if self.running:
             token_ids = self.engine.batched_decode(self.running)
             still_running: list[Request] = []
