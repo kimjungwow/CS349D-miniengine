@@ -202,23 +202,37 @@ class Attention(nn.Module):
         attention_mask: torch.Tensor | None = None,
         cu_seqlens: torch.Tensor | None = None,
         max_seqlen: int | None = None,
-    ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
+        kv_pool: tuple[torch.Tensor, torch.Tensor] | None = None,
+        block_table: torch.Tensor | None = None,
+        cache_seqlens: torch.Tensor | None = None,
+        slot_mapping: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor] | None]:
         """
         Args:
             hidden:         (batch, seq_len, hidden_size)
             cos, sin:       from RotaryEmbedding, broadcastable
-            kv_cache:       optional (cached_k, cached_v), each
+            kv_cache:       legacy per-request cached (K, V), each
                             (batch, num_kv_heads, cache_len, head_dim)
-            attention_mask: optional float mask (batch, 1, q_len, kv_len)
-                            for batched decode with padded KV; 0 = attend,
-                            -inf = ignore.
-            cu_seqlens:     (batch+1,) int32 cumulative sequence lengths for
-                            packed prefill; triggers flash_attn_varlen_func.
+            attention_mask: legacy float mask (batch, 1, q_len, kv_len)
+                            for batched decode with padded KV
+            cu_seqlens:     (batch+1,) int32 — packed prefill cumulative
+                            sequence lengths.
             max_seqlen:     maximum sequence length in the packed batch.
+            kv_pool:        for paged paths: this layer's pool tensors
+                            (K_pool, V_pool), each
+                            (num_pages, page_size, num_kv_heads, head_dim).
+            block_table:    paged decode: (batch, max_pages_per_seq) int32
+                            mapping logical pages → physical page indices.
+            cache_seqlens:  paged decode: (batch,) int32 current cache
+                            length per request.
+            slot_mapping:   paged prefill: (total_tokens,) int64 flat slot
+                            (page_idx * page_size + slot_in_page) for each
+                            packed token's physical position in the pool.
 
         Returns:
             output:       (batch, seq_len, hidden_size)
-            new_kv_cache: (k, v) with updated cache
+            new_kv_cache: (k, v) for legacy paths; None for paged paths
+                          (paged writes happen in-place into kv_pool).
         """
         bsz, seq_len, _ = hidden.shape
 
@@ -247,47 +261,84 @@ class Attention(nn.Module):
         q = apply_rotary_emb(q, cos, sin)
         k = apply_rotary_emb(k, cos, sin)
 
-        # Append to KV cache
+        # Append to KV cache (legacy path only — paged paths write to pool below)
         if kv_cache is not None:
             k = torch.cat([kv_cache[0], k], dim=2)
             v = torch.cat([kv_cache[1], v], dim=2)
-        new_kv = (k, v)
+        new_kv: tuple[torch.Tensor, torch.Tensor] | None = (
+            (k, v) if kv_pool is None else None
+        )
 
         if cu_seqlens is not None:
-            # Packed prefill: flash_attn_varlen_func handles GQA natively —
-            # do not expand k/v before passing.
+            # ── Paged prefill ──────────────────────────────────────────
+            # Scatter freshly computed K/V into the pool at slot_mapping,
+            # then run varlen attention on the same K/V (no past to read).
             from flash_attn import flash_attn_varlen_func
-            # (1, heads, total_tokens, head_dim) → (total_tokens, heads, head_dim)
+
+            k_pool, v_pool = kv_pool
+            num_pages, page_size, num_kv_heads, head_dim = k_pool.shape
+
+            # k,v current: (1, num_kv_heads, total_tokens, head_dim)
+            # → (total_tokens, num_kv_heads, head_dim)
+            k_packed = k.squeeze(0).transpose(0, 1).contiguous()
+            v_packed = v.squeeze(0).transpose(0, 1).contiguous()
+
+            # Scatter into the pool's flat (num_pages * page_size) view.
+            k_pool.view(num_pages * page_size, num_kv_heads, head_dim)[
+                slot_mapping
+            ] = k_packed
+            v_pool.view(num_pages * page_size, num_kv_heads, head_dim)[
+                slot_mapping
+            ] = v_packed
+
             q_fa = q.squeeze(0).transpose(0, 1).contiguous()
-            k_fa = k.squeeze(0).transpose(0, 1).contiguous()
-            v_fa = v.squeeze(0).transpose(0, 1).contiguous()
             out = flash_attn_varlen_func(
-                q_fa, k_fa, v_fa,
+                q_fa, k_packed, v_packed,
                 cu_seqlens_q=cu_seqlens,
                 cu_seqlens_k=cu_seqlens,
                 max_seqlen_q=max_seqlen,
                 max_seqlen_k=max_seqlen,
                 causal=True,
             )
-            # (total_tokens, num_heads, head_dim) → (1, total_tokens, hidden_size)
             out = out.reshape(1, seq_len, self.num_heads * self.head_dim)
+
+        elif block_table is not None:
+            # ── Paged decode ───────────────────────────────────────────
+            # flash_attn_with_kvcache reads existing cache via block_table,
+            # writes the new K/V at cache_seqlens[b] in-place, returns the
+            # attention output.
+            from flash_attn import flash_attn_with_kvcache
+
+            k_pool, v_pool = kv_pool
+
+            # q,k,v: (B, num_heads, 1, head_dim) → (B, 1, num_heads, head_dim)
+            q_fa = q.transpose(1, 2).contiguous()
+            k_new = k.transpose(1, 2).contiguous()
+            v_new = v.transpose(1, 2).contiguous()
+
+            out = flash_attn_with_kvcache(
+                q_fa, k_pool, v_pool,
+                k=k_new, v=v_new,
+                cache_seqlens=cache_seqlens,
+                block_table=block_table,
+                causal=True,
+            )
+            out = out.reshape(bsz, seq_len, self.num_heads * self.head_dim)
+
         else:
-            # GQA: expand KV heads to match Q heads
+            # ── Legacy SDPA (single-request prefill / batched decode) ──
             if self.num_kv_groups > 1:
                 k = k[:, :, None, :, :].expand(-1, -1, self.num_kv_groups, -1, -1)
                 k = k.reshape(bsz, self.num_heads, -1, self.head_dim)
                 v = v[:, :, None, :, :].expand(-1, -1, self.num_kv_groups, -1, -1)
                 v = v.reshape(bsz, self.num_heads, -1, self.head_dim)
 
-            # Batched decode passes an explicit float mask; otherwise fall
-            # back to the is_causal kernel path.
             if attention_mask is not None:
                 out = F.scaled_dot_product_attention(q, k, v, attn_mask=attention_mask)
             else:
                 is_causal = kv_cache is None and seq_len > 1
                 out = F.scaled_dot_product_attention(q, k, v, is_causal=is_causal)
 
-            # Merge heads → project back
             out = out.transpose(1, 2).contiguous().view(bsz, seq_len, -1)
 
         return self.o_proj(out), new_kv
@@ -339,10 +390,20 @@ class TransformerBlock(nn.Module):
         attention_mask: torch.Tensor | None = None,
         cu_seqlens: torch.Tensor | None = None,
         max_seqlen: int | None = None,
-    ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
+        kv_pool: tuple[torch.Tensor, torch.Tensor] | None = None,
+        block_table: torch.Tensor | None = None,
+        cache_seqlens: torch.Tensor | None = None,
+        slot_mapping: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor] | None]:
         residual = hidden
         hidden = self.input_layernorm(hidden)
-        hidden, new_kv = self.self_attn(hidden, cos, sin, kv_cache, attention_mask, cu_seqlens, max_seqlen)
+        hidden, new_kv = self.self_attn(
+            hidden, cos, sin, kv_cache, attention_mask, cu_seqlens, max_seqlen,
+            kv_pool=kv_pool,
+            block_table=block_table,
+            cache_seqlens=cache_seqlens,
+            slot_mapping=slot_mapping,
+        )
         hidden = residual + hidden
 
         residual = hidden
@@ -376,27 +437,42 @@ class TransformerModel(nn.Module):
         attention_mask: torch.Tensor | None = None,
         cu_seqlens: torch.Tensor | None = None,
         max_seqlen: int | None = None,
-    ) -> tuple[torch.Tensor, list[tuple[torch.Tensor, torch.Tensor]]]:
+        kv_pool: list[tuple[torch.Tensor, torch.Tensor]] | None = None,
+        block_table: torch.Tensor | None = None,
+        cache_seqlens: torch.Tensor | None = None,
+        slot_mapping: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, list[tuple[torch.Tensor, torch.Tensor] | None]]:
         """
         Args:
             input_ids:      (batch, seq_len)
             position_ids:   (batch, seq_len)
-            kv_caches:      list of per-layer (key, value) caches, or None
-            attention_mask: optional float mask for batched-decode SDPA
+            kv_caches:      legacy per-layer (K, V) caches, or None
+            attention_mask: legacy float mask for batched-decode SDPA
             cu_seqlens:     (batch+1,) int32 for packed prefill
             max_seqlen:     maximum sequence length in the packed batch
+            kv_pool:        per-layer pool tensors for paged paths
+            block_table:    (B, max_pages) int32 for paged decode
+            cache_seqlens:  (B,) int32 for paged decode
+            slot_mapping:   (T,) int64 for paged prefill scatter
 
         Returns:
             hidden:         (batch, seq_len, hidden_size)
-            new_kv_caches:  list of per-layer (key, value) with appended tokens
+            new_kv_caches:  per-layer (K, V) for legacy paths; None for paged
         """
         hidden = self.embed_tokens(input_ids)
         cos, sin = self.rotary_emb(position_ids)
 
-        new_kv_caches: list[tuple[torch.Tensor, torch.Tensor]] = []
+        new_kv_caches: list[tuple[torch.Tensor, torch.Tensor] | None] = []
         for i, layer in enumerate(self.layers):
             kv = kv_caches[i] if kv_caches is not None else None
-            hidden, new_kv = layer(hidden, cos, sin, kv, attention_mask, cu_seqlens, max_seqlen)
+            kvp = kv_pool[i] if kv_pool is not None else None
+            hidden, new_kv = layer(
+                hidden, cos, sin, kv, attention_mask, cu_seqlens, max_seqlen,
+                kv_pool=kvp,
+                block_table=block_table,
+                cache_seqlens=cache_seqlens,
+                slot_mapping=slot_mapping,
+            )
             new_kv_caches.append(new_kv)
 
         hidden = self.norm(hidden)
@@ -425,14 +501,22 @@ class CausalLM(nn.Module):
         attention_mask: torch.Tensor | None = None,
         cu_seqlens: torch.Tensor | None = None,
         max_seqlen: int | None = None,
-    ) -> tuple[torch.Tensor, list[tuple[torch.Tensor, torch.Tensor]]]:
+        kv_pool: list[tuple[torch.Tensor, torch.Tensor]] | None = None,
+        block_table: torch.Tensor | None = None,
+        cache_seqlens: torch.Tensor | None = None,
+        slot_mapping: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, list[tuple[torch.Tensor, torch.Tensor] | None]]:
         """
         Returns:
             logits:        (batch, seq_len, vocab_size)
-            new_kv_caches: per-layer KV caches
+            new_kv_caches: per-layer KV caches (legacy) or per-layer None (paged)
         """
         hidden, new_kv_caches = self.model(
-            input_ids, position_ids, kv_caches, attention_mask, cu_seqlens, max_seqlen
+            input_ids, position_ids, kv_caches, attention_mask, cu_seqlens, max_seqlen,
+            kv_pool=kv_pool,
+            block_table=block_table,
+            cache_seqlens=cache_seqlens,
+            slot_mapping=slot_mapping,
         )
         if self.config.tie_word_embeddings:
             logits = F.linear(hidden, self.model.embed_tokens.weight)
