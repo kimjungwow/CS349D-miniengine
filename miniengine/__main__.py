@@ -59,6 +59,12 @@ def parse_args() -> argparse.Namespace:
         "(flash_attn_with_kvcache kernel tile constraint).",
     )
     p.add_argument("--mem-fraction-static", type=float, default=0.85)
+    p.add_argument(
+        "--torch-compile",
+        action="store_true",
+        help="Compile a stable sub-region (MLP) of the model with torch.compile "
+        "(milestone 2 Part C).",
+    )
     return p.parse_args()
 
 
@@ -83,6 +89,7 @@ def main() -> None:
     engine = Engine(
         model_path=args.model, dtype=dtype, device=args.device, mode=args.mode, page_size=args.page_size,
                 mem_fraction_static=args.mem_fraction_static,
+        torch_compile=args.torch_compile,
     )
     sched = Scheduler(engine=engine, max_running=args.max_running, mode=args.mode)
 

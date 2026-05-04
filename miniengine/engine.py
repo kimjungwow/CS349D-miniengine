@@ -45,12 +45,14 @@ class Engine:
         mode: str = "batched",
         page_size: int = 32,
         mem_fraction_static: float = 0.85,
+        torch_compile: bool = False,
     ):
         self.device = device
         self.dtype = dtype
         self.mode = mode
         self.page_size = page_size
         self.mem_fraction_static = mem_fraction_static
+        self.torch_compile = torch_compile  # actual compile happens in step 3.2
 
         # ── Tokenizer (still from HF — it's just a tokenizer) ──────────
         logger.info("Loading tokenizer from %s …", model_path)
