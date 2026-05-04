@@ -54,8 +54,10 @@ class KVMemoryPool:
         self.dtype = dtype
         self.device = device
 
-        # Indices of currently-free pages
-        self.free: deque[int] = deque(range(num_pages))
+        # Indices of currently-free pages. Underscore-prefixed because the
+        # public API exposes a `free()` method — same name on the instance
+        # would shadow the method.
+        self._free: deque[int] = deque(range(num_pages))
 
         # Fused K+V tensor: [num_layers, 2, num_pages, page_size, num_kv_heads, head_dim]
         # Indexed as cache[layer, 0/1, page_idx, slot, kv_head, :] for K/V respectively.
@@ -79,17 +81,17 @@ class KVMemoryPool:
 
         Raises if the pool cannot satisfy the request.
         """
-        if num_pages > len(self.free):
+        if num_pages > len(self._free):
             raise ValueError("num_pages is bigger than available pages.")
         ret = []
         for _ in range(num_pages):
-            ret.append(self.free.popleft())
-        raise ret
+            ret.append(self._free.popleft())
+        return ret
 
     def free(self, page_indices: list[int]) -> None:
         """Return the listed pages to the free pool."""
         for i in page_indices:
-            self.free.append(i)
+            self._free.append(i)
             # TODO: Zeroize?
 
     def pages_needed(self, seq_len: int) -> int:
@@ -99,7 +101,7 @@ class KVMemoryPool:
     @property
     def num_free(self) -> int:
         """Pages currently available for allocation."""
-        return len(self.free)
+        return len(self._free)
 
     @property
     def kv_caches(self) -> list[tuple[torch.Tensor, torch.Tensor]]:
