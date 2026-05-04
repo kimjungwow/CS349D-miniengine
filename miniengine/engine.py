@@ -102,6 +102,53 @@ class Engine:
             )
         self.model.eval()
 
+        if torch_compile:
+            # SGLang-style local-scope compile of stable submodules.
+            # Compile every layer's MLP, both RMSNorms, and Q/K-norms,
+            # plus the final RMSNorm. All shape-stable (only the leading
+            # dim varies), no branching, no flash-attn dispatch — clean
+            # targets for dynamo + Inductor fusion.
+            #
+            # Skipped on purpose:
+            #   - Attention.forward as a whole: 4-way branching + flash-attn
+            #     custom ops would force graph breaks per path.
+            #   - RotaryEmbedding: contains CPU↔GPU sync (.item()) and
+            #     dynamic cache extension — would recompile / break. Will
+            #     revisit alongside CUDA graph capture (Task 4).
+            #
+            # mode="default" avoids "reduce-overhead" which internally uses
+            # CUDA graphs and would conflict with explicit graph capture.
+            # dynamic=True so a single graph handles variable leading dims
+            # (batch across decode, total_tokens across prefill).
+            n_layers = len(self.model.model.layers)
+            for layer in self.model.model.layers:
+                layer.mlp = torch.compile(
+                    layer.mlp, mode="default", dynamic=True,
+                )
+                layer.input_layernorm = torch.compile(
+                    layer.input_layernorm, mode="default", dynamic=True,
+                )
+                layer.post_attention_layernorm = torch.compile(
+                    layer.post_attention_layernorm, mode="default", dynamic=True,
+                )
+                layer.self_attn.q_norm = torch.compile(
+                    layer.self_attn.q_norm, mode="default", dynamic=True,
+                )
+                layer.self_attn.k_norm = torch.compile(
+                    layer.self_attn.k_norm, mode="default", dynamic=True,
+                )
+            self.model.model.norm = torch.compile(
+                self.model.model.norm, mode="default", dynamic=True,
+            )
+            logger.info(
+                "torch.compile applied: MLP×%d, in/post layernorms×%d, "
+                "q/k-norms×%d, final norm — total %d submodules",
+                n_layers,
+                2 * n_layers,
+                2 * n_layers,
+                5 * n_layers + 1,
+            )
+
         # ── Stop tokens ─────────────────────────────────────────────────
         self.stop_token_ids: set[int] = set()
         if self.tokenizer.eos_token_id is not None:
