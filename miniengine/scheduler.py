@@ -191,7 +191,9 @@ class Scheduler:
         with self._lock:
             to_prefill: list[Request] = []
             while (
-                self.waiting and len(self.running) + len(to_prefill) < self.max_running
+                self.waiting
+                and len(self.running) + len(to_prefill) < self.max_running
+                and self.engine.can_admit(self.waiting[0])
             ):
                 to_prefill.append(self.waiting.popleft())
 

@@ -140,6 +140,15 @@ class Engine:
             self.kv_pool.num_free,
         )
 
+    def can_admit(self, request: Request) -> bool:
+        """True if the pool currently has enough pages to fit `request`'s
+        prompt. Returns True for non-paged modes (no pool to gate on).
+        """
+        if self.mode != "paged":
+            return True
+        needed = self.kv_pool.pages_needed(request.num_input_tokens)
+        return self.kv_pool.num_free >= needed
+
     def release_pages_for(self, request: Request) -> None:
         """Return any pool pages held by `request` to the free list.
         No-op outside paged mode or if nothing was acquired.
@@ -308,10 +317,18 @@ class Engine:
             )
             req.num_kv_tokens += 1
             # Grow page table if the next decode step would write into a
-            # page this request doesn't own yet.
+            # page this request doesn't own yet. If the pool is exhausted,
+            # terminate the request gracefully instead of crashing the step.
             next_page_idx = req.num_kv_tokens // self.page_size
             if next_page_idx >= len(req.kv_cache):
-                req.kv_cache.extend(self.kv_pool.allocate(1))
+                try:
+                    req.kv_cache.extend(self.kv_pool.allocate(1))
+                except ValueError:
+                    req.sampling_params.max_new_tokens = req.num_output_tokens
+                    logger.warning(
+                        "Pool exhausted mid-decode; terminating %s at output_len=%d",
+                        req.request_id, req.num_output_tokens,
+                    )
 
         return token_ids
 
