@@ -54,7 +54,11 @@ class Request:
     status: RequestStatus = RequestStatus.WAITING
     arrival_time: float = field(default_factory=time.time)
 
-    # Per-request KV cache (set by Engine during prefill, updated on each decode)
+    # Per-request KV cache handle.
+    #   - paged mode: page indices into KVMemoryPool — logical token t lives
+    #     at kv_cache[t // page_size], slot t % page_size.
+    #   - baseline / batched modes: list of per-layer (K, V) tensor tuples
+    #     (legacy storage; type annotation only matches the paged use).
     kv_cache: list[int] = field(default_factory=list)
 
     # How many KV tokens have been written into the pool so far (Part B)
