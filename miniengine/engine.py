@@ -93,6 +93,11 @@ class Engine:
                 device=device,
                 bytes_budget=budget,
             )
+            # Transitional: per-request page indices live here while the
+            # compute paths still use req.kv_cache for legacy tensor storage.
+            # Once paging is wired through prefill/decode, pages move onto
+            # req.kv_cache and this dict goes away.
+            self._pages_per_request: dict[str, list[int]] = {}
         self.model.eval()
 
         # ── Stop tokens ─────────────────────────────────────────────────
@@ -113,6 +118,42 @@ class Engine:
             len(self.tokenizer),
             self.stop_token_ids,
             sum(p.numel() for p in self.model.parameters()) // 1_000_000,
+        )
+
+    # ── Page lifecycle (paged mode) ─────────────────────────────────────
+
+    def acquire_pages_for(self, request: Request) -> None:
+        """Allocate enough pool pages to hold `request`'s prompt and track
+        them under the request's id. No-op outside paged mode.
+        """
+        if self.mode != "paged":
+            return
+        num_pages = self.kv_pool.pages_needed(request.num_input_tokens)
+        pages = self.kv_pool.allocate(num_pages) if num_pages > 0 else []
+        self._pages_per_request[request.request_id] = pages
+        logger.debug(
+            "Acquired %d pages for %s (prompt_len=%d, pool_free=%d)",
+            num_pages,
+            request.request_id,
+            request.num_input_tokens,
+            self.kv_pool.num_free,
+        )
+
+    def release_pages_for(self, request: Request) -> None:
+        """Return any pool pages held by `request` to the free list.
+        No-op outside paged mode or if nothing was acquired.
+        """
+        if self.mode != "paged":
+            return
+        pages = self._pages_per_request.pop(request.request_id, None)
+        if not pages:
+            return
+        self.kv_pool.free(pages)
+        logger.debug(
+            "Released %d pages from %s (pool_free=%d)",
+            len(pages),
+            request.request_id,
+            self.kv_pool.num_free,
         )
 
     # ── Tokenization ────────────────────────────────────────────────────

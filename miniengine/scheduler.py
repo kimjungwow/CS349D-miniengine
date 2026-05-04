@@ -197,6 +197,7 @@ class Scheduler:
 
         if to_prefill:
             for req in to_prefill:
+                self.engine.acquire_pages_for(req)
                 req.status = RequestStatus.RUNNING
 
             token_ids_prefill = self.engine.batched_prefill(to_prefill)
@@ -243,6 +244,7 @@ class Scheduler:
     def _finish_request(self, req: Request, finished_list: list[Request]) -> None:
         """Mark a request as finished and free its resources."""
         req.status = RequestStatus.FINISHED
+        self.engine.release_pages_for(req)  # no-op outside paged mode
         req.kv_cache = None  # release GPU memory
         req.token_queue.put(TokenOutput(token_id=-1, token_text="", finished=True))
         finished_list.append(req)
