@@ -54,8 +54,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--page-size",
         type=int,
-        default=32,
-        help="Tokens per KV cache page. Smaller = less tail waste; larger = smaller page tables.",
+        default=256,
+        help="Tokens per KV cache page. Must be a multiple of 256 in paged mode "
+        "(flash_attn_with_kvcache kernel tile constraint).",
     )
     p.add_argument("--mem-fraction-static", type=float, default=0.85)
     return p.parse_args()
