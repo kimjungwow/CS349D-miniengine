@@ -123,23 +123,20 @@ class Engine:
     # ── Page lifecycle (paged mode) ─────────────────────────────────────
 
     def acquire_pages_for(self, request: Request) -> None:
-        """Allocate enough pool pages for the request's full lifetime
-        (prompt + max_new_tokens) and store the page indices on
-        `request.kv_cache`. No-op outside paged mode.
+        """Allocate just enough pool pages to hold the prompt and store the
+        page indices on `request.kv_cache`. Decode-time growth allocates one
+        more page per page_size tokens written. No-op outside paged mode.
         """
         if self.mode != "paged":
             return
-        total_len = (
-            request.num_input_tokens + request.sampling_params.max_new_tokens
-        )
-        num_pages = self.kv_pool.pages_needed(total_len)
+        num_pages = self.kv_pool.pages_needed(request.num_input_tokens)
         pages = self.kv_pool.allocate(num_pages) if num_pages > 0 else []
         request.kv_cache = pages
         logger.debug(
-            "Acquired %d pages for %s (total_len=%d, pool_free=%d)",
+            "Acquired %d pages for %s (prompt_len=%d, pool_free=%d)",
             num_pages,
             request.request_id,
-            total_len,
+            request.num_input_tokens,
             self.kv_pool.num_free,
         )
 
@@ -310,6 +307,11 @@ class Engine:
                 sample_token(logits[i:i+1, -1, :], req.sampling_params, req.output_ids)
             )
             req.num_kv_tokens += 1
+            # Grow page table if the next decode step would write into a
+            # page this request doesn't own yet.
+            next_page_idx = req.num_kv_tokens // self.page_size
+            if next_page_idx >= len(req.kv_cache):
+                req.kv_cache.extend(self.kv_pool.allocate(1))
 
         return token_ids
 
