@@ -1,0 +1,61 @@
+
+============================================================
+  Accuracy Benchmark
+  Dataset     : gsm8k
+  Samples     : 100
+  Max tokens  : 512
+  Concurrency : 8
+  Server      : http://localhost:8000
+============================================================
+
+Loading dataset...
+  Loaded 100 samples
+
+Running evaluation...
+  [10/100] accuracy=90.0%  latency=28.2s
+  [20/100] accuracy=85.0%  latency=10.0s
+  [30/100] accuracy=73.3%  latency=12.3s
+  [40/100] accuracy=77.5%  latency=7.9s
+  [50/100] accuracy=76.0%  latency=13.8s
+  [60/100] accuracy=80.0%  latency=9.2s
+  [70/100] accuracy=78.6%  latency=10.0s
+  [80/100] accuracy=77.5%  latency=19.4s
+  [90/100] accuracy=75.6%  latency=17.7s
+  [100/100] accuracy=75.0%  latency=17.6s
+
+============================================================
+  GSM8K Accuracy Report
+  Samples    : 100
+  Correct    : 75
+  Accuracy   : 75.0%
+  Avg latency: 15.95s
+============================================================
+
+  Sample incorrect predictions (5 of 25):
+    Gold=452  Pred=475  Output: Let's break this down step by step.
+
+---
+
+### **1. Usual Sleep Duration**
+
+Kim u...
+    Gold=34  Pred=39  Output: Let's solve this step by step.
+
+---
+
+### **Step 1: Total number of balloons Sall...
+    Gold=105  Pred=**First Test:**  Output: We are given the following information:
+
+---
+
+### **First Test:**
+- Total questi...
+    Gold=1  Pred=$1  Output: Let's solve this step by step.
+
+---
+
+### **Step 1: Understand the daily items an...
+    Gold=18  Pred=10  Output: We are given the following information:
+
+- Erin **scored 14 points**.
+- After sc...

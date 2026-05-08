@@ -1,0 +1,51 @@
+
+============================================================
+  Accuracy Benchmark
+  Dataset     : mmlu
+  Samples     : 200
+  Max tokens  : 32
+  Concurrency : 8
+  Server      : http://localhost:8000
+============================================================
+
+Loading dataset...
+  Loaded 200 samples
+
+Running evaluation...
+  [10/200] accuracy=70.0%  latency=0.2s
+  [20/200] accuracy=65.0%  latency=0.3s
+  [30/200] accuracy=60.0%  latency=0.3s
+  [40/200] accuracy=55.0%  latency=1.3s
+  [50/200] accuracy=58.0%  latency=0.4s
+  [60/200] accuracy=58.3%  latency=0.5s
+  [70/200] accuracy=62.9%  latency=0.3s
+  [80/200] accuracy=61.3%  latency=0.4s
+  [90/200] accuracy=60.0%  latency=0.1s
+  [100/200] accuracy=60.0%  latency=1.7s
+  [110/200] accuracy=57.3%  latency=0.3s
+  [120/200] accuracy=58.3%  latency=1.6s
+  [130/200] accuracy=59.2%  latency=0.1s
+  [140/200] accuracy=60.0%  latency=0.5s
+  [150/200] accuracy=59.3%  latency=1.4s
+  [160/200] accuracy=60.0%  latency=0.1s
+  [170/200] accuracy=60.0%  latency=0.2s
+  [180/200] accuracy=61.7%  latency=0.1s
+  [190/200] accuracy=61.1%  latency=1.5s
+  [200/200] accuracy=61.5%  latency=1.0s
+
+============================================================
+  MMLU Accuracy Report
+  Samples    : 200
+  Correct    : 123
+  Accuracy   : 61.5%
+  Avg latency: 0.66s
+============================================================
+
+  Sample incorrect predictions (5 of 77):
+    Gold=1  Pred=2  Output: C...
+    Gold=2  Pred=1  Output: B. 2...
+    Gold=1  Pred=0  Output: A. Task culture...
+    Gold=1  Pred=2  Output: C. left submandibular lymph node....
+    Gold=0  Pred=None  Output: To solve this, we need to understand the energy levels of positronium.
+
+### Posi...
