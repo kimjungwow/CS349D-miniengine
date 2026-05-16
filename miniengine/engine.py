@@ -514,77 +514,147 @@ class Engine:
         if s is not None and s.page_table and self.pool is not None:
             self.pool.free(s.page_table)
 
+    def paged_prefill_additional_pages_needed(
+        self, req: Request, chunk_size: int = 0
+    ) -> int:
+        """Pages needed to run this request's next prefill chunk.
+
+        ``chunk_size == 0`` means the original unchunked path: extend all
+        the way to the full prompt.  Positive values cap the next prefill
+        extension for this request only.
+        """
+        assert self.pool is not None
+        s = self._state(req)
+        prompt_len = len(req.input_ids)
+        start = s.cache_seq_len
+        if start >= prompt_len:
+            return 0
+        end = prompt_len if chunk_size <= 0 else min(start + chunk_size, prompt_len)
+        return max(0, self.pool.pages_needed(end) - len(s.page_table))
+
     # ── Paged prefill (varlen, packed, no padding) ──────────────────────
 
     @torch.inference_mode()
-    def paged_batched_prefill(self, requests: list[Request]) -> list[int]:
-        """Pack N prompts into one varlen forward; sample first token each."""
+    def paged_batched_prefill(
+        self, requests: list[Request], chunk_size: int = 0
+    ) -> list[int | None]:
+        """Pack N prefill chunks into one varlen forward.
+
+        Returns one entry per request.  ``None`` means that request still has
+        prompt tokens left to prefill; an ``int`` is the first generated token
+        after the final prompt chunk.
+        """
         if not requests:
             return []
         assert self.pool is not None
+        if chunk_size < 0:
+            raise ValueError(f"chunk_size must be non-negative, got {chunk_size}")
+
         states = [self._state(r) for r in requests]
+        starts: list[int] = []
+        ends: list[int] = []
+        q_lens: list[int] = []
+        kv_lens: list[int] = []
         for r, s in zip(requests, states):
-            s.page_table = self.pool.allocate(self.pool.pages_needed(len(r.input_ids)))
-            s.cache_seq_len = 0
+            prompt_len = len(r.input_ids)
+            start = s.cache_seq_len
+            if start >= prompt_len:
+                raise RuntimeError(
+                    f"request {r.request_id} has no prompt tokens left to prefill"
+                )
+            end = prompt_len if chunk_size == 0 else min(start + chunk_size, prompt_len)
+            needed_pages = self.pool.pages_needed(end)
+            if needed_pages > len(s.page_table):
+                s.page_table.extend(
+                    self.pool.allocate(needed_pages - len(s.page_table))
+                )
+            starts.append(start)
+            ends.append(end)
+            q_lens.append(end - start)
+            kv_lens.append(end)
 
-        seq_lens = [len(r.input_ids) for r in requests]
-        cu = _cu_seqlens(seq_lens, self.device)
+        cu_q = _cu_seqlens(q_lens, self.device)
+        cu_k = _cu_seqlens(kv_lens, self.device)
 
-        flat_ids = [t for r in requests for t in r.input_ids]
-        flat_pos = [p for n in seq_lens for p in range(n)]
+        flat_ids = [
+            token
+            for r, start, end in zip(requests, starts, ends)
+            for token in r.input_ids[start:end]
+        ]
+        flat_pos = [
+            pos for start, end in zip(starts, ends) for pos in range(start, end)
+        ]
         input_ids = _to_long(flat_ids, self.device).unsqueeze(0)  # (1, T) packed
         position_ids = _to_long(flat_pos, self.device).unsqueeze(0)
-        last_idx = (cu[1:] - 1).long()
+        last_idx = (cu_q[1:] - 1).long()
 
         common = dict(
             kv_pool_caches=self._kv_pool_caches,
             logits_indices=last_idx,
         )
         if self.attention_backend == "flashinfer":
-            backend_kwargs = self._fi_kwargs_prefill(states, seq_lens)
+            backend_kwargs = self._fi_kwargs_prefill(states, starts, q_lens, kv_lens)
         else:
-            backend_kwargs = self._fa_kwargs_prefill(states, seq_lens, cu)
+            backend_kwargs = self._fa_kwargs_prefill(
+                states, starts, q_lens, kv_lens, cu_q, cu_k
+            )
 
         logits, _ = self.model(input_ids, position_ids, **common, **backend_kwargs)
         # (1, num_seqs, vocab) thanks to logits_indices
 
-        out: list[int] = []
-        for i, (r, s, n) in enumerate(zip(requests, states, seq_lens)):
-            s.cache_seq_len = n
-            out.append(
-                sample_token(logits[0, i : i + 1], r.sampling_params, r.output_ids)
-            )
+        out: list[int | None] = []
+        for i, (r, s, end) in enumerate(zip(requests, states, ends)):
+            s.cache_seq_len = end
+            if end < len(r.input_ids):
+                out.append(None)
+            else:
+                out.append(
+                    sample_token(
+                        logits[0, i : i + 1], r.sampling_params, r.output_ids
+                    )
+                )
         return out
 
     # ── Backend-specific prefill metadata builders ─────────────────────
 
     def _fa_kwargs_prefill(
-        self, states: list[_PagedState], seq_lens: list[int], cu: torch.Tensor
+        self,
+        states: list[_PagedState],
+        starts: list[int],
+        q_lens: list[int],
+        kv_lens: list[int],
+        cu_q: torch.Tensor,
+        cu_k: torch.Tensor,
     ) -> dict:
         """flash_attn varlen prefill metadata: slot_mapping + block_table."""
         ps = self.page_size
         slot_mapping = _to_long(
             [
-                s.page_table[i // ps] * ps + i % ps
-                for s, n in zip(states, seq_lens)
-                for i in range(n)
+                s.page_table[pos // ps] * ps + pos % ps
+                for s, start, q_len in zip(states, starts, q_lens)
+                for pos in range(start, start + q_len)
             ],
             self.device,
         )
-        # max_seqlen_* pinned to max_position (a constant) so torch.compile
-        # doesn't retrace as actual lengths grow.  The kernel uses
-        # cu_seqlens_* for true lengths; max_seqlen_* only sizes the grid.
+        page_tables = [
+            s.page_table[: self.pool.pages_needed(kv_len)]  # type: ignore[union-attr]
+            for s, kv_len in zip(states, kv_lens)
+        ]
         return dict(
             slot_mapping=slot_mapping,
-            cu_seqlens_q=cu,
-            cu_seqlens_k=cu,
-            max_seqlen_q=self.max_position,
-            max_seqlen_k=self.max_position,
-            block_table=_page_table([s.page_table for s in states], self.device),
+            cu_seqlens_q=cu_q,
+            cu_seqlens_k=cu_k,
+            max_seqlen_q=max(q_lens),
+            max_seqlen_k=max(kv_lens),
+            block_table=_page_table(page_tables, self.device),
         )
 
     def _fi_kwargs_prefill(
-        self, states: list[_PagedState], seq_lens: list[int]
+        self,
+        states: list[_PagedState],
+        starts: list[int],
+        q_lens: list[int],
+        kv_lens: list[int],
     ) -> dict:
         """flashinfer prefill metadata: plan() the wrapper and bundle the
         per-token append metadata."""
@@ -594,12 +664,16 @@ class Engine:
         # batch_indices[i], positions[i] tell append_paged_kv_cache where
         # the i-th token in the packed flat tensor lives in the pool.
         batch_indices = torch.tensor(
-            [b for b, n in enumerate(seq_lens) for _ in range(n)],
+            [b for b, q_len in enumerate(q_lens) for _ in range(q_len)],
             dtype=torch.int32,
             device=self.device,
         )
         positions = torch.tensor(
-            [p for n in seq_lens for p in range(n)],
+            [
+                pos
+                for start, q_len in zip(starts, q_lens)
+                for pos in range(start, start + q_len)
+            ],
             dtype=torch.int32,
             device=self.device,
         )
@@ -608,19 +682,25 @@ class Engine:
         #   kv_indptr  — prefix sum of pages-per-request  (B+1,)
         #   kv_indices — flat list of page indices         (sum_pages,)
         #   kv_last_page_len — fill of the last page       (B,)
-        page_counts = [len(s.page_table) for s in states]
+        page_counts = [
+            self.pool.pages_needed(kv_len) for kv_len in kv_lens  # type: ignore[union-attr]
+        ]
         kv_indptr = _to_int32_cumsum(page_counts, self.device)
         kv_indices = torch.tensor(
-            [p for s in states for p in s.page_table],
+            [
+                p
+                for s, pc in zip(states, page_counts)
+                for p in s.page_table[:pc]
+            ],
             dtype=torch.int32,
             device=self.device,
         )
         kv_last_page_len = torch.tensor(
-            [((n - 1) % ps) + 1 if n > 0 else 0 for n in seq_lens],
+            [((n - 1) % ps) + 1 if n > 0 else 0 for n in kv_lens],
             dtype=torch.int32,
             device=self.device,
         )
-        qo_indptr = _to_int32_cumsum(seq_lens, self.device)
+        qo_indptr = _to_int32_cumsum(q_lens, self.device)
 
         self._fi_prefill_wrapper.plan(
             qo_indptr=qo_indptr,

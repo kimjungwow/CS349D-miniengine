@@ -116,6 +116,13 @@ def parse_args() -> argparse.Namespace:
         default=16384,
         help="paged: max RoPE position; cos/sin tables are sized at engine init",
     )
+    p.add_argument(
+        "--prefill-chunk-size",
+        type=int,
+        default=0,
+        help="paged: max prompt tokens per request per prefill step. "
+        "0 disables chunked prefill.",
+    )
 
     # ── Milestone-2 accelerator flags (additive) ───────────────────────
     p.add_argument(
@@ -139,7 +146,10 @@ def parse_args() -> argparse.Namespace:
         default=32,
         help="paged: max KV pages per sequence the captured graph supports",
     )
-    return p.parse_args()
+    args = p.parse_args()
+    if args.prefill_chunk_size < 0:
+        p.error("--prefill-chunk-size must be non-negative")
+    return args
 
 
 def main() -> None:
@@ -183,7 +193,12 @@ def main() -> None:
         attention_backend=args.attention_backend,
         flashinfer_workspace_mb=args.flashinfer_workspace_mb,
     )
-    sched = Scheduler(engine=engine, max_running=args.max_running, mode=args.mode)
+    sched = Scheduler(
+        engine=engine,
+        max_running=args.max_running,
+        mode=args.mode,
+        prefill_chunk_size=args.prefill_chunk_size,
+    )
 
     # Wire up the server module globals
     srv.engine = engine

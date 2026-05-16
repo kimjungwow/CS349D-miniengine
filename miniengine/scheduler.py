@@ -43,13 +43,21 @@ class Scheduler:
         stop()             — gracefully shut down
     """
 
-    def __init__(self, engine: Engine, max_running: int = 16, mode: str = "paged"):
+    def __init__(
+        self,
+        engine: Engine,
+        max_running: int = 16,
+        mode: str = "paged",
+        prefill_chunk_size: int = 0,
+    ):
         self.engine = engine
         self.max_running = max_running
         self.mode = mode
+        self.prefill_chunk_size = prefill_chunk_size
 
         # Queues
         self.waiting: deque[Request] = deque()
+        self.prefilling: deque[Request] = deque()
         self.running: list[Request] = []
 
         # Thread control
@@ -92,7 +100,7 @@ class Scheduler:
 
     def _loop(self) -> None:
         while self._running_flag:
-            has_work = bool(self.waiting) or bool(self.running)
+            has_work = bool(self.waiting) or bool(self.prefilling) or bool(self.running)
             if not has_work:
                 time.sleep(0.005)  # idle sleep to avoid busy-waiting
                 continue
@@ -184,7 +192,7 @@ class Scheduler:
         Paged-mode step — same shape as ``_step_batched`` but:
 
           - admission is gated by KV-pool page availability,
-          - prefill is varlen-batched (one packed forward for all admissions),
+          - prefill is varlen-batched, optionally in per-request chunks,
           - decode is paged + flash_attn (with optional CUDA graph),
           - finishing a request frees its KV pages via
             ``engine.free_paged_state``.
@@ -193,24 +201,49 @@ class Scheduler:
         pool = self.engine.pool
         assert pool is not None, "scheduler in paged mode but engine has no KV pool"
 
-        # ── Phase 1: admit + batched paged prefill ──────────────────────
+        # ── Phase 1: resume/admit + batched paged prefill ───────────────
         with self._lock:
             to_prefill: list[Request] = []
+            pages_available = pool.num_free
+
+            while self.prefilling:
+                req = self.prefilling[0]
+                needed = self.engine.paged_prefill_additional_pages_needed(
+                    req, self.prefill_chunk_size
+                )
+                if pages_available < needed:
+                    break
+                pages_available -= needed
+                to_prefill.append(self.prefilling.popleft())
+
+            active = len(self.running) + len(self.prefilling) + len(to_prefill)
             while (
                 self.waiting
-                and len(self.running) + len(to_prefill) < self.max_running
+                and not self.prefilling
+                and active < self.max_running
             ):
                 req = self.waiting[0]
-                if pool.num_free < pool.pages_needed(len(req.input_ids)):
+                needed = self.engine.paged_prefill_additional_pages_needed(
+                    req, self.prefill_chunk_size
+                )
+                if pages_available < needed:
                     break  # can't fit; wait for pages to free
+                pages_available -= needed
                 to_prefill.append(self.waiting.popleft())
+                active += 1
 
         if to_prefill:
             for req in to_prefill:
                 req.status = RequestStatus.RUNNING
             for req, token_id in zip(
-                to_prefill, self.engine.paged_batched_prefill(to_prefill)
+                to_prefill,
+                self.engine.paged_batched_prefill(
+                    to_prefill, chunk_size=self.prefill_chunk_size
+                ),
             ):
+                if token_id is None:
+                    self.prefilling.append(req)
+                    continue
                 req.output_ids.append(token_id)
                 self._stream_token(req, token_id)
                 if self._check_finished(req, token_id):
