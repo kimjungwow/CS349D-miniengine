@@ -32,6 +32,7 @@ from transformers import AutoTokenizer
 from miniengine.core import Request
 from miniengine.kv_memory_pool import KVMemoryPool
 from miniengine.model import CausalLM, FlashInferContext, ModelConfig, load_weights
+from miniengine.radix_cache import RadixCache, RadixNode
 from miniengine.sampler import sample_token
 
 logger = logging.getLogger(__name__)
@@ -52,6 +53,8 @@ class _PagedState:
 
     page_table: list[int] = field(default_factory=list)
     cache_seq_len: int = 0
+    cache_node: RadixNode | None = None
+    cache_prepared: bool = False
 
 
 class Engine:
@@ -82,6 +85,7 @@ class Engine:
         cuda_graph_max_pages: int = 32,
         attention_backend: str = "flashinfer",
         flashinfer_workspace_mb: int = 128,
+        disable_radix_cache: bool = False,
     ):
         if cuda_graph and mode != "paged":
             raise ValueError("cuda_graph requires mode='paged'")
@@ -138,6 +142,7 @@ class Engine:
 
         # ── Paged-mode setup (only when mode == "paged") ───────────────
         self.pool: KVMemoryPool | None = None
+        self.radix_cache: RadixCache | None = None
         self.page_size = page_size
         self.max_position = max_position
         self._kv_pool_caches: list[tuple[torch.Tensor, torch.Tensor]] | None = None
@@ -170,6 +175,12 @@ class Engine:
                 bytes_budget=kv_pool_bytes,
             )
             self._kv_pool_caches = self.pool.kv_caches
+            if not disable_radix_cache:
+                self.radix_cache = RadixCache(self.pool)
+                self.pool.radix_cache = self.radix_cache
+                logger.info("radix prefix cache enabled (page_size=%d)", page_size)
+            else:
+                logger.info("radix prefix cache disabled")
             # Pre-grow RoPE so the paged forward stays alloc-free
             # (graph-capture and torch.compile safe).
             self.model.model.rotary_emb.preallocate(
@@ -508,11 +519,87 @@ class Engine:
             self._paged_state[req.request_id] = s
         return s
 
+    def prepare_paged_prefill(self, req: Request) -> None:
+        """Attach any reusable radix-cache prefix before prefill admission."""
+        s = self._state(req)
+        if s.cache_prepared:
+            return
+
+        req.cache_hit_tokens = 0
+        cache = self.radix_cache
+        if cache is not None and len(req.input_ids) > 1:
+            match = cache.match_prefix(req.input_ids[:-1])
+            if match.matched_tokens > 0:
+                s.page_table = list(match.matched_pages)
+                s.cache_seq_len = match.matched_tokens
+                s.cache_node = match.last_node
+                req.cache_hit_tokens = match.matched_tokens
+                cache.inc_lock_ref(s.cache_node)
+
+        s.cache_prepared = True
+
+    def release_paged_prefill(self, req: Request) -> None:
+        """Undo a prepared-but-not-admitted cache match."""
+        s = self._paged_state.pop(req.request_id, None)
+        if s is None:
+            return
+        if self.radix_cache is not None and s.cache_node is not None:
+            self.radix_cache.dec_lock_ref(s.cache_node)
+        req.cache_hit_tokens = 0
+
     def free_paged_state(self, req: Request) -> None:
         """Release a request's pages back to the pool."""
+        if self.radix_cache is not None:
+            self.commit_paged_cache(req, finished=True)
+            return
+
         s = self._paged_state.pop(req.request_id, None)
         if s is not None and s.page_table and self.pool is not None:
             self.pool.free(s.page_table)
+
+    def commit_paged_cache(self, req: Request, *, finished: bool) -> None:
+        """Insert KV-backed pages into the radix cache and release duplicates."""
+        assert self.pool is not None
+        cache = self.radix_cache
+        if cache is None:
+            if finished:
+                self.free_paged_state(req)
+            return
+
+        s = self._paged_state.get(req.request_id)
+        if s is None:
+            return
+
+        old_node = s.cache_node
+        old_cached_pages = len(cache.pages_for_node(old_node))
+        all_ids = req.input_ids + req.output_ids
+        cacheable_len = min(s.cache_seq_len, len(all_ids))
+        pages_for_cacheable = s.page_table[: self.pool.pages_needed(cacheable_len)]
+        new_node, redundant_pages = cache.insert_and_return(
+            all_ids[:cacheable_len], pages_for_cacheable
+        )
+        cached_pages = cache.pages_for_node(new_node)
+        cached_page_count = len(cached_pages)
+
+        if cached_page_count > 0:
+            s.page_table[:cached_page_count] = cached_pages
+
+        if old_node is not None:
+            cache.dec_lock_ref(old_node)
+
+        if finished:
+            duplicate_pages = redundant_pages[old_cached_pages:]
+            tail_pages = s.page_table[cached_page_count:]
+            self.pool.free(duplicate_pages + tail_pages)
+            self._paged_state.pop(req.request_id, None)
+            return
+
+        duplicate_pages = redundant_pages[old_cached_pages:]
+        self.pool.free(duplicate_pages)
+        s.cache_node = new_node if cached_page_count > 0 else None
+        if s.cache_node is not None:
+            cache.inc_lock_ref(s.cache_node)
+        s.cache_prepared = True
 
     def paged_prefill_additional_pages_needed(
         self, req: Request, chunk_size: int = 0
@@ -524,6 +611,7 @@ class Engine:
         extension for this request only.
         """
         assert self.pool is not None
+        self.prepare_paged_prefill(req)
         s = self._state(req)
         prompt_len = len(req.input_ids)
         start = s.cache_seq_len

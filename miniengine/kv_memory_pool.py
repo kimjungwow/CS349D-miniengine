@@ -30,8 +30,12 @@ from __future__ import annotations
 
 import logging
 import math
+from typing import TYPE_CHECKING
 
 import torch
+
+if TYPE_CHECKING:
+    from miniengine.radix_cache import RadixCache
 
 logger = logging.getLogger(__name__)
 
@@ -77,6 +81,7 @@ class KVMemoryPool:
         self.head_dim = head_dim
         self.dtype = dtype
         self.device = device
+        self.radix_cache: RadixCache | None = None
 
         shape = (num_pages, page_size, num_kv_heads, head_dim)
         self.k_caches = [
@@ -113,6 +118,9 @@ class KVMemoryPool:
         if num_pages == 0:
             return []
         if len(self._free) < num_pages:
+            if self.radix_cache is not None:
+                self.radix_cache.evict(num_pages - len(self._free))
+        if len(self._free) < num_pages:
             raise RuntimeError(
                 f"KV pool exhausted: requested {num_pages}, "
                 f"have {len(self._free)} free pages"
@@ -139,6 +147,13 @@ class KVMemoryPool:
     def num_free(self) -> int:
         """Pages currently available for allocation (excludes scratch)."""
         return len(self._free)
+
+    @property
+    def num_evictable(self) -> int:
+        """Cached pages the pool can evict before reporting exhaustion."""
+        if self.radix_cache is None:
+            return 0
+        return self.radix_cache.num_evictable_pages()
 
     @property
     def kv_caches(self) -> list[tuple[torch.Tensor, torch.Tensor]]:

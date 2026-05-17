@@ -123,6 +123,11 @@ def parse_args() -> argparse.Namespace:
         help="paged: max prompt tokens per request per prefill step. "
         "0 disables chunked prefill.",
     )
+    p.add_argument(
+        "--disable-radix-cache",
+        action="store_true",
+        help="paged: disable the radix prefix cache for baseline comparison.",
+    )
 
     # ── Milestone-2 accelerator flags (additive) ───────────────────────
     p.add_argument(
@@ -192,6 +197,7 @@ def main() -> None:
         cuda_graph_max_pages=args.cuda_graph_max_pages,
         attention_backend=args.attention_backend,
         flashinfer_workspace_mb=args.flashinfer_workspace_mb,
+        disable_radix_cache=args.disable_radix_cache,
     )
     sched = Scheduler(
         engine=engine,

@@ -194,7 +194,7 @@ class Scheduler:
           - admission is gated by KV-pool page availability,
           - prefill is varlen-batched, optionally in per-request chunks,
           - decode is paged + flash_attn (with optional CUDA graph),
-          - finishing a request frees its KV pages via
+          - finishing a request commits/free its KV pages via
             ``engine.free_paged_state``.
         """
         finished: list[Request] = []
@@ -204,16 +204,17 @@ class Scheduler:
         # ── Phase 1: resume/admit + batched paged prefill ───────────────
         with self._lock:
             to_prefill: list[Request] = []
-            pages_available = pool.num_free
+            pages_reserved = 0
 
             while self.prefilling:
                 req = self.prefilling[0]
                 needed = self.engine.paged_prefill_additional_pages_needed(
                     req, self.prefill_chunk_size
                 )
+                pages_available = pool.num_free + pool.num_evictable - pages_reserved
                 if pages_available < needed:
                     break
-                pages_available -= needed
+                pages_reserved += needed
                 to_prefill.append(self.prefilling.popleft())
 
             active = len(self.running) + len(self.prefilling) + len(to_prefill)
@@ -223,12 +224,15 @@ class Scheduler:
                 and active < self.max_running
             ):
                 req = self.waiting[0]
+                self.engine.prepare_paged_prefill(req)
                 needed = self.engine.paged_prefill_additional_pages_needed(
                     req, self.prefill_chunk_size
                 )
+                pages_available = pool.num_free + pool.num_evictable - pages_reserved
                 if pages_available < needed:
+                    self.engine.release_paged_prefill(req)
                     break  # can't fit; wait for pages to free
-                pages_available -= needed
+                pages_reserved += needed
                 to_prefill.append(self.waiting.popleft())
                 active += 1
 
@@ -249,6 +253,7 @@ class Scheduler:
                 if self._check_finished(req, token_id):
                     self._finish_request(req, finished)
                 else:
+                    self.engine.commit_paged_cache(req, finished=False)
                     self.running.append(req)
 
         # ── Phase 2: paged batched decode ───────────────────────────────
