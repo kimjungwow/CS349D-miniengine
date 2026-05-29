@@ -19,12 +19,14 @@ import time
 import uuid
 from typing import AsyncGenerator
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request as FastAPIRequest
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
-from miniengine.core import Request, SamplingParams, TokenOutput
+from miniengine.core import Request as EngineRequest
+from miniengine.core import SamplingParams, TokenOutput
 from miniengine.engine import Engine
+from miniengine.profiling import log_request_event, now
 from miniengine.scheduler import Scheduler
 
 logger = logging.getLogger(__name__)
@@ -105,8 +107,33 @@ async def list_models():
     }
 
 
+def _bool_header(value: str | None) -> bool | None:
+    if value is None:
+        return None
+    return value.lower() in {"1", "true", "yes", "y"}
+
+
+def _profile_metadata(http_request: FastAPIRequest) -> dict:
+    headers = http_request.headers
+    metadata = {
+        "run_id": headers.get("x-agentbench-run-id"),
+        "workflow_id": headers.get("x-agentbench-workflow-id"),
+        "task_id": headers.get("x-agentbench-task-id"),
+        "sample_index": headers.get("x-agentbench-sample-index"),
+        "step_id": headers.get("x-agentbench-step-id"),
+        "agent_type": headers.get("x-agentbench-agent-type"),
+        "workload": headers.get("x-agentbench-workload"),
+        "call_type": headers.get("x-agentbench-call-type"),
+        "is_optional": _bool_header(headers.get("x-agentbench-is-optional")),
+        "is_critical": _bool_header(headers.get("x-agentbench-is-critical")),
+        "branch_id": headers.get("x-agentbench-branch-id"),
+        "attempt_id": headers.get("x-agentbench-attempt-id"),
+    }
+    return {key: value for key, value in metadata.items() if value is not None}
+
+
 @app.post("/v1/chat/completions")
-async def chat_completions(raw: ChatCompletionRequest):
+async def chat_completions(raw: ChatCompletionRequest, http_request: FastAPIRequest):
     assert engine is not None and scheduler is not None
 
     # Tokenize the conversation using the model's chat template
@@ -123,10 +150,22 @@ async def chat_completions(raw: ChatCompletionRequest):
         ),
     )
 
-    req = Request(
+    req = EngineRequest(
         request_id=str(uuid.uuid4()),
         input_ids=input_ids,
         sampling_params=sampling_params,
+        profile_metadata=_profile_metadata(http_request),
+    )
+    req.profile_received_ts = now()
+    log_request_event(
+        req,
+        "request_received",
+        prompt_tokens=req.num_input_tokens,
+        max_new_tokens=sampling_params.max_new_tokens,
+        temperature=sampling_params.temperature,
+        top_p=sampling_params.top_p,
+        top_k=sampling_params.top_k,
+        stream=raw.stream,
     )
     scheduler.add_request(req)
 
@@ -146,7 +185,7 @@ async def chat_completions(raw: ChatCompletionRequest):
 # ── Streaming helpers ───────────────────────────────────────────────────
 
 
-async def _stream_response(req: Request, model: str) -> AsyncGenerator[str, None]:
+async def _stream_response(req: EngineRequest, model: str) -> AsyncGenerator[str, None]:
     """Yield SSE chunks as tokens arrive from the scheduler.
 
     The final chunk includes ``usage`` with prefix-cache hit information
@@ -170,7 +209,7 @@ async def _stream_response(req: Request, model: str) -> AsyncGenerator[str, None
         yield f"data: {json.dumps(chunk)}\n\n"
 
 
-async def _collect_full_response(req: Request) -> tuple[str, dict]:
+async def _collect_full_response(req: EngineRequest) -> tuple[str, dict]:
     """Block until the request finishes; return (text, usage dict)."""
     loop = asyncio.get_event_loop()
     parts: list[str] = []
@@ -181,7 +220,7 @@ async def _collect_full_response(req: Request) -> tuple[str, dict]:
         parts.append(output.token_text)
 
 
-def _usage_from_request(req: Request) -> dict:
+def _usage_from_request(req: EngineRequest) -> dict:
     """Build the OpenAI-style ``usage`` block straight off the request.
 
     ``cache_hit_tokens`` is our extension — number of prompt tokens

@@ -29,6 +29,8 @@ Usage
     # response's ``usage.cache_hit_tokens``.
     python -m benchmark.bench_cache --workload shared    --num-requests 100
     python -m benchmark.bench_cache --workload multiturn --num-sessions 16 --turns-per-session 5
+    python -m benchmark.bench_cache --workload shared   --num-groups 10 --questions-per-group 10 --shared-prefix-len 2000 --concurrency 4
+    python -m benchmark.bench_cache --workload shared   --num-groups 10 --questions-per-group 10 --shared-prefix-len 4000 --concurrency 4
 
 Validation pattern: run twice — once against ``--base-url`` of a server
 launched with ``--disable-radix-cache``, once against one with the
@@ -441,7 +443,7 @@ def main() -> None:
     p = argparse.ArgumentParser(
         description="Cache effectiveness benchmark (shared prefix / multi-turn)",
     )
-    p.add_argument("--base-url", default="http://localhost:8001")
+    p.add_argument("--base-url", default="http://localhost:8000")
     p.add_argument(
         "--workload",
         choices=["shared", "multiturn"],

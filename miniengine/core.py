@@ -67,6 +67,24 @@ class Request:
     # cache effectiveness.
     cache_hit_tokens: int = 0
 
+    # ── Retraction bookkeeping (paged mode only) ──────────────────────
+    # ``needs_rehydrate`` means the scheduler retracted this request's
+    # paged KV state after some output had already been streamed.  The
+    # engine must rebuild KV for ``input_ids + output_ids[:-1]`` without
+    # sampling or streaming another token before decode resumes.
+    needs_rehydrate: bool = False
+    num_retractions: int = 0
+
+    # ── AgentBench profiling metadata/timestamps ─────────────────────
+    profile_metadata: dict[str, Any] = field(default_factory=dict)
+    profile_received_ts: float | None = None
+    profile_scheduled_ts: float | None = None
+    profile_prefill_start_ts: float | None = None
+    profile_prefill_end_ts: float | None = None
+    profile_first_token_ts: float | None = None
+    profile_decode_end_ts: float | None = None
+    profile_finished_ts: float | None = None
+
     # ── Derived properties ─────────────────────────────────────────────
 
     @property

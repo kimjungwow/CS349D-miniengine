@@ -128,6 +128,12 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="paged: disable the radix prefix cache for baseline comparison.",
     )
+    p.add_argument(
+        "--enable-retraction",
+        action="store_true",
+        help="paged: recover from decode-time KV pool exhaustion by retracting "
+        "a running request and rehydrating it later.",
+    )
 
     # ── Milestone-2 accelerator flags (additive) ───────────────────────
     p.add_argument(
@@ -154,6 +160,8 @@ def parse_args() -> argparse.Namespace:
     args = p.parse_args()
     if args.prefill_chunk_size < 0:
         p.error("--prefill-chunk-size must be non-negative")
+    if args.enable_retraction and args.mode != "paged":
+        p.error("--enable-retraction requires --mode paged")
     return args
 
 
@@ -204,6 +212,7 @@ def main() -> None:
         max_running=args.max_running,
         mode=args.mode,
         prefill_chunk_size=args.prefill_chunk_size,
+        enable_retraction=args.enable_retraction,
     )
 
     # Wire up the server module globals

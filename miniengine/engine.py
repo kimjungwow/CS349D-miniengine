@@ -519,21 +519,48 @@ class Engine:
             self._paged_state[req.request_id] = s
         return s
 
+    def _paged_prefill_ids(self, req: Request) -> list[int]:
+        """Token sequence whose KV must exist after the current prefill path."""
+        if req.needs_rehydrate:
+            return req.input_ids + req.output_ids[:-1]
+        return req.input_ids
+
+    def paged_prefill_complete(self, req: Request) -> bool:
+        """Whether the request's current normal/rehydrate prefill is done."""
+        s = self._state(req)
+        return s.cache_seq_len >= len(self._paged_prefill_ids(req))
+
+    def paged_retractable_pages(self, req: Request) -> int:
+        """Pages that ``retract_paged_state`` would return to the pool."""
+        if self.pool is None:
+            return 0
+        s = self._paged_state.get(req.request_id)
+        if s is None:
+            return 0
+        cached_pages = 0
+        if self.radix_cache is not None and s.cache_node is not None:
+            cached_pages = len(self.radix_cache.pages_for_node(s.cache_node))
+        return max(0, len(s.page_table) - cached_pages)
+
     def prepare_paged_prefill(self, req: Request) -> None:
         """Attach any reusable radix-cache prefix before prefill admission."""
         s = self._state(req)
         if s.cache_prepared:
             return
 
-        req.cache_hit_tokens = 0
+        prefill_ids = self._paged_prefill_ids(req)
+        match_tokens = prefill_ids if req.needs_rehydrate else prefill_ids[:-1]
+        if not req.needs_rehydrate:
+            req.cache_hit_tokens = 0
         cache = self.radix_cache
-        if cache is not None and len(req.input_ids) > 1:
-            match = cache.match_prefix(req.input_ids[:-1])
+        if cache is not None and match_tokens:
+            match = cache.match_prefix(match_tokens)
             if match.matched_tokens > 0:
                 s.page_table = list(match.matched_pages)
                 s.cache_seq_len = match.matched_tokens
                 s.cache_node = match.last_node
-                req.cache_hit_tokens = match.matched_tokens
+                if not req.needs_rehydrate:
+                    req.cache_hit_tokens = match.matched_tokens
                 cache.inc_lock_ref(s.cache_node)
 
         s.cache_prepared = True
@@ -545,7 +572,8 @@ class Engine:
             return
         if self.radix_cache is not None and s.cache_node is not None:
             self.radix_cache.dec_lock_ref(s.cache_node)
-        req.cache_hit_tokens = 0
+        if not req.needs_rehydrate:
+            req.cache_hit_tokens = 0
 
     def free_paged_state(self, req: Request) -> None:
         """Release a request's pages back to the pool."""
@@ -556,6 +584,35 @@ class Engine:
         s = self._paged_state.pop(req.request_id, None)
         if s is not None and s.page_table and self.pool is not None:
             self.pool.free(s.page_table)
+
+    def retract_paged_state(self, req: Request) -> int:
+        """Release a running request's request-owned KV pages for retraction.
+
+        Cached prefix pages borrowed from the radix cache are unlocked but not
+        returned directly to the pool; they remain cache-owned and can be
+        evicted through the cache's normal LRU path.
+        """
+        assert self.pool is not None
+        s = self._paged_state.pop(req.request_id, None)
+        if s is None:
+            return 0
+
+        pages_to_free: list[int]
+        cached_page_count = 0
+        if self.radix_cache is not None and s.cache_node is not None:
+            cached_page_count = len(self.radix_cache.pages_for_node(s.cache_node))
+            self.radix_cache.dec_lock_ref(s.cache_node)
+
+        pages_to_free = s.page_table[cached_page_count:]
+        self.pool.free(pages_to_free)
+        logger.info(
+            "Retracted request %s  (freed_pages=%d, cached_pages=%d, seq_len=%d)",
+            req.request_id,
+            len(pages_to_free),
+            cached_page_count,
+            s.cache_seq_len,
+        )
+        return len(pages_to_free)
 
     def commit_paged_cache(self, req: Request, *, finished: bool) -> None:
         """Insert KV-backed pages into the radix cache and release duplicates."""
@@ -613,11 +670,15 @@ class Engine:
         assert self.pool is not None
         self.prepare_paged_prefill(req)
         s = self._state(req)
-        prompt_len = len(req.input_ids)
+        prefill_len = len(self._paged_prefill_ids(req))
         start = s.cache_seq_len
-        if start >= prompt_len:
+        if start >= prefill_len:
             return 0
-        end = prompt_len if chunk_size <= 0 else min(start + chunk_size, prompt_len)
+        end = (
+            prefill_len
+            if chunk_size <= 0
+            else min(start + chunk_size, prefill_len)
+        )
         return max(0, self.pool.pages_needed(end) - len(s.page_table))
 
     # ── Paged prefill (varlen, packed, no padding) ──────────────────────
@@ -628,9 +689,11 @@ class Engine:
     ) -> list[int | None]:
         """Pack N prefill chunks into one varlen forward.
 
-        Returns one entry per request.  ``None`` means that request still has
-        prompt tokens left to prefill; an ``int`` is the first generated token
-        after the final prompt chunk.
+        Returns one entry per request.  For normal prefill, an ``int`` is the
+        first generated token after the final prompt chunk and ``None`` means
+        more prompt chunks remain.  For rehydration, ``None`` means no token was
+        sampled; the scheduler checks ``paged_prefill_complete`` to distinguish
+        complete rehydration from an incomplete chunk.
         """
         if not requests:
             return []
@@ -639,18 +702,23 @@ class Engine:
             raise ValueError(f"chunk_size must be non-negative, got {chunk_size}")
 
         states = [self._state(r) for r in requests]
+        prefill_ids_by_req = [self._paged_prefill_ids(r) for r in requests]
         starts: list[int] = []
         ends: list[int] = []
         q_lens: list[int] = []
         kv_lens: list[int] = []
-        for r, s in zip(requests, states):
-            prompt_len = len(r.input_ids)
+        for r, s, prefill_ids in zip(requests, states, prefill_ids_by_req):
+            prefill_len = len(prefill_ids)
             start = s.cache_seq_len
-            if start >= prompt_len:
+            if start >= prefill_len:
                 raise RuntimeError(
-                    f"request {r.request_id} has no prompt tokens left to prefill"
+                    f"request {r.request_id} has no tokens left to prefill"
                 )
-            end = prompt_len if chunk_size == 0 else min(start + chunk_size, prompt_len)
+            end = (
+                prefill_len
+                if chunk_size == 0
+                else min(start + chunk_size, prefill_len)
+            )
             needed_pages = self.pool.pages_needed(end)
             if needed_pages > len(s.page_table):
                 s.page_table.extend(
@@ -666,8 +734,8 @@ class Engine:
 
         flat_ids = [
             token
-            for r, start, end in zip(requests, starts, ends)
-            for token in r.input_ids[start:end]
+            for prefill_ids, start, end in zip(prefill_ids_by_req, starts, ends)
+            for token in prefill_ids[start:end]
         ]
         flat_pos = [
             pos for start, end in zip(starts, ends) for pos in range(start, end)
@@ -691,9 +759,13 @@ class Engine:
         # (1, num_seqs, vocab) thanks to logits_indices
 
         out: list[int | None] = []
-        for i, (r, s, end) in enumerate(zip(requests, states, ends)):
+        for i, (r, s, end, prefill_ids) in enumerate(
+            zip(requests, states, ends, prefill_ids_by_req)
+        ):
             s.cache_seq_len = end
-            if end < len(r.input_ids):
+            if end < len(prefill_ids):
+                out.append(None)
+            elif r.needs_rehydrate:
                 out.append(None)
             else:
                 out.append(

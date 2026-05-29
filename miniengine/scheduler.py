@@ -23,6 +23,7 @@ from collections import deque
 
 from miniengine.core import Request, RequestStatus, TokenOutput
 from miniengine.engine import Engine
+from miniengine.profiling import log_request_event, now
 
 logger = logging.getLogger(__name__)
 
@@ -49,14 +50,17 @@ class Scheduler:
         max_running: int = 16,
         mode: str = "paged",
         prefill_chunk_size: int = 0,
+        enable_retraction: bool = False,
     ):
         self.engine = engine
         self.max_running = max_running
         self.mode = mode
         self.prefill_chunk_size = prefill_chunk_size
+        self.enable_retraction = enable_retraction
 
         # Queues
         self.waiting: deque[Request] = deque()
+        self.retracted: deque[Request] = deque()
         self.prefilling: deque[Request] = deque()
         self.running: list[Request] = []
 
@@ -100,7 +104,12 @@ class Scheduler:
 
     def _loop(self) -> None:
         while self._running_flag:
-            has_work = bool(self.waiting) or bool(self.prefilling) or bool(self.running)
+            has_work = (
+                bool(self.waiting)
+                or bool(self.retracted)
+                or bool(self.prefilling)
+                or bool(self.running)
+            )
             if not has_work:
                 time.sleep(0.005)  # idle sleep to avoid busy-waiting
                 continue
@@ -133,7 +142,10 @@ class Scheduler:
             req = self.waiting.popleft()
 
         req.status = RequestStatus.RUNNING
+        self._mark_scheduled(req)
+        self._mark_prefill_start(req)
         token_id = self.engine.prefill(req)
+        self._mark_prefill_end(req)
         req.output_ids.append(token_id)
         self._stream_token(req, token_id)
 
@@ -164,7 +176,10 @@ class Scheduler:
 
         for req in to_prefill:
             req.status = RequestStatus.RUNNING
+            self._mark_scheduled(req)
+            self._mark_prefill_start(req)
             token_id = self.engine.prefill(req)
+            self._mark_prefill_end(req)
             req.output_ids.append(token_id)
             self._stream_token(req, token_id)
             if self._check_finished(req, token_id):
@@ -202,6 +217,7 @@ class Scheduler:
         assert pool is not None, "scheduler in paged mode but engine has no KV pool"
 
         # ── Phase 1: resume/admit + batched paged prefill ───────────────
+        rehydrated_ready: list[Request] = []
         with self._lock:
             to_prefill: list[Request] = []
             pages_reserved = 0
@@ -219,8 +235,32 @@ class Scheduler:
 
             active = len(self.running) + len(self.prefilling) + len(to_prefill)
             while (
+                self.retracted
+                and not self.prefilling
+                and active < self.max_running
+            ):
+                req = self.retracted[0]
+                self.engine.prepare_paged_prefill(req)
+                if self.engine.paged_prefill_complete(req):
+                    rehydrated_ready.append(self.retracted.popleft())
+                    active += 1
+                    continue
+
+                needed = self.engine.paged_prefill_additional_pages_needed(
+                    req, self.prefill_chunk_size
+                )
+                pages_available = pool.num_free + pool.num_evictable - pages_reserved
+                if pages_available < needed:
+                    self.engine.release_paged_prefill(req)
+                    break
+                pages_reserved += needed
+                to_prefill.append(self.retracted.popleft())
+                active += 1
+
+            while (
                 self.waiting
                 and not self.prefilling
+                and not self.retracted
                 and active < self.max_running
             ):
                 req = self.waiting[0]
@@ -236,18 +276,45 @@ class Scheduler:
                 to_prefill.append(self.waiting.popleft())
                 active += 1
 
+        for req in rehydrated_ready:
+            req.status = RequestStatus.RUNNING
+            self._mark_scheduled(req)
+            req.needs_rehydrate = False
+            self.running.append(req)
+            logger.info(
+                "Rehydrated request %s from cached pages  (retractions=%d)",
+                req.request_id,
+                req.num_retractions,
+            )
+
         if to_prefill:
             for req in to_prefill:
                 req.status = RequestStatus.RUNNING
+                self._mark_scheduled(req)
+                self._mark_prefill_start(req)
             for req, token_id in zip(
                 to_prefill,
                 self.engine.paged_batched_prefill(
                     to_prefill, chunk_size=self.prefill_chunk_size
                 ),
             ):
+                if req.needs_rehydrate:
+                    if self.engine.paged_prefill_complete(req):
+                        req.needs_rehydrate = False
+                        self.running.append(req)
+                        logger.info(
+                            "Rehydrated request %s  (retractions=%d)",
+                            req.request_id,
+                            req.num_retractions,
+                        )
+                    else:
+                        self.prefilling.append(req)
+                    continue
+
                 if token_id is None:
                     self.prefilling.append(req)
                     continue
+                self._mark_prefill_end(req)
                 req.output_ids.append(token_id)
                 self._stream_token(req, token_id)
                 if self._check_finished(req, token_id):
@@ -258,20 +325,118 @@ class Scheduler:
 
         # ── Phase 2: paged batched decode ───────────────────────────────
         if self.running:
-            token_ids = self.engine.paged_batched_decode(self.running)
-            still_running: list[Request] = []
-            for req, token_id in zip(self.running, token_ids):
-                req.output_ids.append(token_id)
-                self._stream_token(req, token_id)
-                if self._check_finished(req, token_id):
-                    self._finish_request(req, finished)
-                else:
-                    still_running.append(req)
-            self.running = still_running
+            token_ids = self._paged_decode_with_retraction()
+            if token_ids is not None:
+                still_running: list[Request] = []
+                for req, token_id in zip(self.running, token_ids):
+                    req.output_ids.append(token_id)
+                    self._stream_token(req, token_id)
+                    if self._check_finished(req, token_id):
+                        self._finish_request(req, finished)
+                    else:
+                        still_running.append(req)
+                self.running = still_running
 
         return finished
 
+    def _paged_decode_with_retraction(self) -> list[int] | None:
+        """Decode running requests, retracting victims on KV-pool exhaustion."""
+        while self.running:
+            try:
+                return self.engine.paged_batched_decode(self.running)
+            except RuntimeError as exc:
+                if not self.enable_retraction or not self._is_kv_pool_exhausted(exc):
+                    raise
+
+                victim = self._choose_retraction_victim()
+                if victim is None:
+                    logger.warning(
+                        "KV pool exhausted during decode, but no request has "
+                        "retractable pages"
+                    )
+                    raise
+
+                self.running.remove(victim)
+                freed = self.engine.retract_paged_state(victim)
+                victim.needs_rehydrate = True
+                victim.num_retractions += 1
+                victim.status = RequestStatus.WAITING
+                self.retracted.appendleft(victim)
+                log_request_event(
+                    victim,
+                    "request_retracted",
+                    freed_pages=freed,
+                    num_retractions=victim.num_retractions,
+                    remaining_running=len(self.running),
+                )
+                logger.warning(
+                    "Retracted request %s after decode allocation failure "
+                    "(freed_pages=%d, retractions=%d, remaining_running=%d)",
+                    victim.request_id,
+                    freed,
+                    victim.num_retractions,
+                    len(self.running),
+                )
+
+        return None
+
+    def _choose_retraction_victim(self) -> Request | None:
+        """Pick the largest useful victim, then highest remaining work, youngest."""
+        candidates = [
+            req for req in self.running if self.engine.paged_retractable_pages(req) > 0
+        ]
+        if not candidates:
+            return None
+
+        def key(req: Request) -> tuple[int, int, float]:
+            remaining = req.sampling_params.max_new_tokens - req.num_output_tokens
+            return (
+                self.engine.paged_retractable_pages(req),
+                remaining,
+                req.arrival_time,
+            )
+
+        return max(candidates, key=key)
+
+    def _is_kv_pool_exhausted(self, exc: RuntimeError) -> bool:
+        return "KV pool exhausted" in str(exc)
+
     # ── Helpers ─────────────────────────────────────────────────────────
+
+    def _mark_scheduled(self, req: Request) -> None:
+        if req.profile_scheduled_ts is not None:
+            return
+        req.profile_scheduled_ts = now()
+        log_request_event(
+            req,
+            "request_scheduled",
+            waiting=len(self.waiting),
+            running=len(self.running),
+            prefilling=len(self.prefilling),
+            retracted=len(self.retracted),
+        )
+
+    def _mark_prefill_start(self, req: Request) -> None:
+        if req.profile_prefill_start_ts is not None:
+            return
+        req.profile_prefill_start_ts = now()
+        log_request_event(
+            req,
+            "prefill_start",
+            prompt_tokens=req.num_input_tokens,
+            cache_hit_tokens=req.cache_hit_tokens,
+        )
+
+    def _mark_prefill_end(self, req: Request) -> None:
+        if req.profile_prefill_end_ts is not None:
+            return
+        req.profile_prefill_end_ts = now()
+        log_request_event(
+            req,
+            "prefill_end",
+            prompt_tokens=req.num_input_tokens,
+            cache_hit_tokens=req.cache_hit_tokens,
+        )
 
     def _check_finished(self, req: Request, token_id: int) -> bool:
         """Decide whether a request should stop generating."""
@@ -284,6 +449,14 @@ class Scheduler:
     def _stream_token(self, req: Request, token_id: int) -> None:
         """Push a generated token into the request's streaming queue."""
         text = self.engine.decode_token(token_id)
+        if req.profile_first_token_ts is None:
+            req.profile_first_token_ts = now()
+            log_request_event(
+                req,
+                "first_token",
+                output_tokens=req.num_output_tokens,
+                token_id=token_id,
+            )
         req.token_queue.put(
             TokenOutput(token_id=token_id, token_text=text, finished=False)
         )
@@ -291,11 +464,30 @@ class Scheduler:
     def _finish_request(self, req: Request, finished_list: list[Request]) -> None:
         """Mark a request as finished and free its resources."""
         req.status = RequestStatus.FINISHED
+        if req.profile_decode_end_ts is None:
+            req.profile_decode_end_ts = now()
+            log_request_event(
+                req,
+                "decode_end",
+                completion_tokens=req.num_output_tokens,
+            )
         req.kv_cache = None  # release GPU memory (baseline / batched modes)
         if self.mode == "paged":
             self.engine.free_paged_state(req)
         req.token_queue.put(TokenOutput(token_id=-1, token_text="", finished=True))
         finished_list.append(req)
+        req.profile_finished_ts = now()
+        finish_reason = "length" if req.is_finished else "stop"
+        log_request_event(
+            req,
+            "request_finished",
+            prompt_tokens=req.num_input_tokens,
+            completion_tokens=req.num_output_tokens,
+            total_tokens=req.num_input_tokens + req.num_output_tokens,
+            cache_hit_tokens=req.cache_hit_tokens,
+            num_retractions=req.num_retractions,
+            finish_reason=finish_reason,
+        )
 
         self.total_finished += 1
         self.total_generated_tokens += req.num_output_tokens
