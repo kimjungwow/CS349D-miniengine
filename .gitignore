@@ -57,3 +57,7 @@ Thumbs.db
 *.pt
 *.pth
 *.gguf
+
+miniengine/*
+*.txt
+*.png
