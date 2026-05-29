@@ -27,6 +27,12 @@ from miniengine.profiling import log_request_event, now
 
 logger = logging.getLogger(__name__)
 
+SCHEDULER_POLICIES = ("fcfs", "agent-cache-aware")
+AGE_WEIGHT = 1.0
+CACHE_WEIGHT = 0.002
+CRITICAL_WEIGHT = 5.0
+OPTIONAL_PENALTY = 2.0
+
 
 class Scheduler:
     """
@@ -51,12 +57,19 @@ class Scheduler:
         mode: str = "paged",
         prefill_chunk_size: int = 0,
         enable_retraction: bool = False,
+        scheduler_policy: str = "fcfs",
     ):
+        if scheduler_policy not in SCHEDULER_POLICIES:
+            raise ValueError(
+                f"scheduler_policy must be one of {SCHEDULER_POLICIES}, "
+                f"got {scheduler_policy!r}"
+            )
         self.engine = engine
         self.max_running = max_running
         self.mode = mode
         self.prefill_chunk_size = prefill_chunk_size
         self.enable_retraction = enable_retraction
+        self.scheduler_policy = scheduler_policy
 
         # Queues
         self.waiting: deque[Request] = deque()
@@ -91,7 +104,7 @@ class Scheduler:
         self._running_flag = True
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
-        logger.info("Scheduler started")
+        logger.info("Scheduler started  (policy=%s)", self.scheduler_policy)
 
     def stop(self) -> None:
         """Signal the scheduler to stop and wait for the thread to join."""
@@ -263,17 +276,14 @@ class Scheduler:
                 and not self.retracted
                 and active < self.max_running
             ):
-                req = self.waiting[0]
-                self.engine.prepare_paged_prefill(req)
-                needed = self.engine.paged_prefill_additional_pages_needed(
-                    req, self.prefill_chunk_size
+                picked = self._select_waiting_request_for_paged_prefill(
+                    pages_reserved, pool
                 )
-                pages_available = pool.num_free + pool.num_evictable - pages_reserved
-                if pages_available < needed:
-                    self.engine.release_paged_prefill(req)
+                if picked is None:
                     break  # can't fit; wait for pages to free
+                req, needed = picked
                 pages_reserved += needed
-                to_prefill.append(self.waiting.popleft())
+                to_prefill.append(req)
                 active += 1
 
         for req in rehydrated_ready:
@@ -338,6 +348,78 @@ class Scheduler:
                 self.running = still_running
 
         return finished
+
+    def _select_waiting_request_for_paged_prefill(
+        self,
+        pages_reserved: int,
+        pool,
+    ) -> tuple[Request, int] | None:
+        """Pick the next waiting request for paged prefill admission."""
+        if self.scheduler_policy != "agent-cache-aware":
+            req = self.waiting[0]
+            self.engine.prepare_paged_prefill(req)
+            needed = self.engine.paged_prefill_additional_pages_needed(
+                req, self.prefill_chunk_size
+            )
+            pages_available = pool.num_free + pool.num_evictable - pages_reserved
+            if pages_available < needed:
+                self.engine.release_paged_prefill(req)
+                return None
+            return self.waiting.popleft(), needed
+
+        candidates: list[tuple[float, int, Request, int]] = []
+        for idx, req in enumerate(self.waiting):
+            priority = self._agent_cache_priority(req)
+            estimated_needed = self.engine.estimate_paged_prefill_additional_pages_needed(
+                req, self.prefill_chunk_size
+            )
+            candidates.append((priority, -idx, req, estimated_needed))
+        candidates.sort(reverse=True)
+
+        for _priority, neg_idx, req, estimated_needed in candidates:
+            pages_available = pool.num_free + pool.num_evictable - pages_reserved
+            if pages_available < estimated_needed:
+                continue
+
+            self.engine.prepare_paged_prefill(req)
+            needed = self.engine.paged_prefill_additional_pages_needed(
+                req, self.prefill_chunk_size
+            )
+            pages_available = pool.num_free + pool.num_evictable - pages_reserved
+            if pages_available < needed:
+                self.engine.release_paged_prefill(req)
+                continue
+
+            del self.waiting[-neg_idx]
+            return req, needed
+
+        return None
+
+    def _agent_cache_priority(self, req: Request) -> float:
+        """Score waiting agentic requests by age, cache reuse, and criticality."""
+        metadata = req.profile_metadata or {}
+        queue_age = max(0.0, time.time() - req.arrival_time)
+        estimated_hit = self.engine.estimate_paged_cache_hit_tokens(req)
+        is_optional = self._metadata_bool(metadata, "is_optional")
+        is_critical = self._metadata_bool(metadata, "is_critical")
+
+        priority = (
+            AGE_WEIGHT * queue_age
+            + CACHE_WEIGHT * estimated_hit
+            + (CRITICAL_WEIGHT if is_critical else 0.0)
+            - (OPTIONAL_PENALTY if is_optional else 0.0)
+        )
+        req.estimated_cache_hit_tokens = estimated_hit
+        req.scheduler_priority = priority
+        return priority
+
+    def _metadata_bool(self, metadata: dict, key: str) -> bool:
+        value = metadata.get(key, False)
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            return value.lower() in {"1", "true", "yes", "y"}
+        return bool(value)
 
     def _paged_decode_with_retraction(self) -> list[int] | None:
         """Decode running requests, retracting victims on KV-pool exhaustion."""
@@ -410,6 +492,9 @@ class Scheduler:
         log_request_event(
             req,
             "request_scheduled",
+            scheduler_policy=self.scheduler_policy,
+            estimated_cache_hit_tokens=req.estimated_cache_hit_tokens,
+            scheduler_priority=req.scheduler_priority,
             waiting=len(self.waiting),
             running=len(self.running),
             prefilling=len(self.prefilling),
@@ -425,6 +510,8 @@ class Scheduler:
             "prefill_start",
             prompt_tokens=req.num_input_tokens,
             cache_hit_tokens=req.cache_hit_tokens,
+            estimated_cache_hit_tokens=req.estimated_cache_hit_tokens,
+            scheduler_priority=req.scheduler_priority,
         )
 
     def _mark_prefill_end(self, req: Request) -> None:
@@ -436,6 +523,8 @@ class Scheduler:
             "prefill_end",
             prompt_tokens=req.num_input_tokens,
             cache_hit_tokens=req.cache_hit_tokens,
+            estimated_cache_hit_tokens=req.estimated_cache_hit_tokens,
+            scheduler_priority=req.scheduler_priority,
         )
 
     def _check_finished(self, req: Request, token_id: int) -> bool:
@@ -485,6 +574,8 @@ class Scheduler:
             completion_tokens=req.num_output_tokens,
             total_tokens=req.num_input_tokens + req.num_output_tokens,
             cache_hit_tokens=req.cache_hit_tokens,
+            estimated_cache_hit_tokens=req.estimated_cache_hit_tokens,
+            scheduler_priority=req.scheduler_priority,
             num_retractions=req.num_retractions,
             finish_reason=finish_reason,
         )

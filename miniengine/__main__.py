@@ -26,7 +26,7 @@ import torch
 import uvicorn
 
 from miniengine.engine import Engine, ATTENTION_BACKENDS
-from miniengine.scheduler import Scheduler
+from miniengine.scheduler import SCHEDULER_POLICIES, Scheduler
 from miniengine import server as srv
 
 
@@ -52,6 +52,14 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=16,
         help="Max concurrent requests in the scheduler",
+    )
+    p.add_argument(
+        "--scheduler-policy",
+        type=str,
+        default="fcfs",
+        choices=list(SCHEDULER_POLICIES),
+        help="Request admission policy. agent-cache-aware prioritizes "
+        "AgentBench critical/cache-beneficial requests in paged mode.",
     )
     p.add_argument(
         "--mode",
@@ -162,6 +170,8 @@ def parse_args() -> argparse.Namespace:
         p.error("--prefill-chunk-size must be non-negative")
     if args.enable_retraction and args.mode != "paged":
         p.error("--enable-retraction requires --mode paged")
+    if args.scheduler_policy == "agent-cache-aware" and args.mode != "paged":
+        p.error("--scheduler-policy agent-cache-aware requires --mode paged")
     return args
 
 
@@ -213,6 +223,7 @@ def main() -> None:
         mode=args.mode,
         prefill_chunk_size=args.prefill_chunk_size,
         enable_retraction=args.enable_retraction,
+        scheduler_policy=args.scheduler_policy,
     )
 
     # Wire up the server module globals

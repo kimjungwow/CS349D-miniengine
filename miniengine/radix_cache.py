@@ -137,6 +137,10 @@ class RadixCache:
             last_node=node if matched_tokens > 0 else None,
         )
 
+    def preview_match_tokens(self, tokens: list[int]) -> int:
+        """Return page-aligned prefix hit length without mutating cache state."""
+        return self._tree_walk_readonly(tokens)[1]
+
     # ── Lock ref counting (sglang-style) ───────────────────────────────
 
     def inc_lock_ref(self, node: RadixNode | None) -> None:
@@ -297,6 +301,36 @@ class RadixCache:
             if match_len < len(child.key):
                 node = self._split_node(child, match_len)
                 node.last_access = now
+                break
+
+            node = child
+
+        return node, prefix_len
+
+    def _tree_walk_readonly(self, tokens: list[int]) -> tuple[RadixNode, int]:
+        """Read-only version of ``_tree_walk`` for scheduling estimates.
+
+        It intentionally avoids last-access refreshes and node splitting so
+        policy scoring cannot perturb cache metrics, LRU state, or tree shape.
+        """
+        limit = self._align_down(len(tokens))
+        node = self.root
+        prefix_len = 0
+
+        while prefix_len < limit:
+            child = node.children.get(
+                self._child_key(tokens[prefix_len : prefix_len + self.page_size])
+            )
+            if child is None:
+                break
+
+            match_len = self._common_prefix_len(child.key, tokens[prefix_len:limit])
+            match_len = self._align_down(match_len)
+            if match_len == 0:
+                break
+
+            prefix_len += match_len
+            if match_len < len(child.key):
                 break
 
             node = child

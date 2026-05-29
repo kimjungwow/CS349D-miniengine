@@ -85,6 +85,12 @@ class Request:
     profile_decode_end_ts: float | None = None
     profile_finished_ts: float | None = None
 
+    # ── Scheduler policy observability (Milestone 4) ─────────────────
+    # Populated by agent-aware scheduling before admission. These fields
+    # are diagnostic only; they do not affect sampling or response shape.
+    estimated_cache_hit_tokens: int = 0
+    scheduler_priority: float = 0.0
+
     # ── Derived properties ─────────────────────────────────────────────
 
     @property

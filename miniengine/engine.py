@@ -530,6 +530,33 @@ class Engine:
         s = self._state(req)
         return s.cache_seq_len >= len(self._paged_prefill_ids(req))
 
+    def estimate_paged_cache_hit_tokens(self, req: Request) -> int:
+        """Preview page-aligned radix-cache hit tokens without mutating state."""
+        cache = self.radix_cache
+        if cache is None:
+            return 0
+        prefill_ids = self._paged_prefill_ids(req)
+        match_tokens = prefill_ids if req.needs_rehydrate else prefill_ids[:-1]
+        if not match_tokens:
+            return 0
+        return cache.preview_match_tokens(match_tokens)
+
+    def estimate_paged_prefill_additional_pages_needed(
+        self, req: Request, chunk_size: int = 0
+    ) -> int:
+        """Estimate pages needed for the next prefill chunk without cache locks."""
+        assert self.pool is not None
+        prefill_len = len(self._paged_prefill_ids(req))
+        start = min(self.estimate_paged_cache_hit_tokens(req), prefill_len)
+        if start >= prefill_len:
+            return 0
+        end = (
+            prefill_len
+            if chunk_size <= 0
+            else min(start + chunk_size, prefill_len)
+        )
+        return max(0, self.pool.pages_needed(end) - self.pool.pages_needed(start))
+
     def paged_retractable_pages(self, req: Request) -> int:
         """Pages that ``retract_paged_state`` would return to the pool."""
         if self.pool is None:
